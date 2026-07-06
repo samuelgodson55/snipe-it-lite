@@ -1,0 +1,310 @@
+// =============================================================================
+// js/components/assets.js
+// -----------------------------------------------------------------------------
+// "Asset Inventory" table + the Dispatch (Issue/Checkout) drawer + the
+// Properties Hub / Asset Pool Details modal (capacity edit, isolate/recall
+// exceptions). Everything in this file is about AssetType pools.
+// =============================================================================
+
+import { apiRequest } from '../api.js';
+import { escapeHtml, openModal, closeModal, toggleRoute, toggleCapacityEdit, statusBadge, tableState, registerRenderer, filterAndPaginate, renderPaginationBar } from '../ui.js';
+import { refreshDashboard } from '../dashboard.js';
+
+let currentDispatchAssetId = null; // remembers which asset the open dispatch drawer is for
+let currentPropsAssetId = null;    // remembers which asset the open properties hub is for
+
+// custody.js needs to know which asset's Properties Hub is open (if any) so
+// that processReturn() can refresh it after a return -- exposed as a getter
+// rather than a mutable export so ownership of the variable stays here.
+export function getCurrentPropsAssetId() {
+  return currentPropsAssetId;
+}
+
+// ---- Asset Inventory table ----
+export async function loadAssets() {
+  const tbody = document.getElementById('assetTableBody');
+  if (!tbody) return; // this page doesn't have an asset table
+  try {
+    // GET /assets now returns a paginated envelope --
+    // { items, total, limit, offset } -- instead of a bare array (Data
+    // Quality & Usability requirement #4). We request a generous limit so
+    // the existing fast client-side search/pagination in js/ui.js's
+    // filterAndPaginate() keeps working exactly as before for realistic
+    // inventory sizes; the backend still enforces a hard MAX_LIMIT cap
+    // regardless of what's requested, so a single call can never pull back
+    // an unbounded number of rows.
+    const result = await apiRequest('/assets?limit=1000');
+    tableState.assets.raw = result.items;
+    renderAssetsTable();
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4" class="px-5 py-6 text-center text-rose-400">${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+export function renderAssetsTable() {
+  const tbody = document.getElementById('assetTableBody');
+  if (!tbody) return;
+  const isManagerView = document.body.dataset.view === 'manager';
+
+  // Search across asset name only -- that's the only user-facing text field
+  // an Asset Pool has (see "Search by asset name, tag, or serial…" hint).
+  const { pageRows, total, startIndex } = filterAndPaginate('assets', ['name']);
+  document.querySelectorAll('.asset-pool-count').forEach(el => el.textContent = total);
+
+  tbody.innerHTML = pageRows.map(a => `
+    <tr class="transition hover:bg-card2/40">
+      <td class="px-5 py-3.5">
+        <p class="font-medium text-slate-100">${escapeHtml(a.name)}</p>
+        <p class="tag-mono text-[11px] text-slate-500">POOL-${a.id}</p>
+      </td>
+      <td class="px-5 py-3.5 tag-mono text-slate-300">${a.available_quantity} / ${a.total_quantity} units</td>
+      <td class="px-5 py-3.5">${statusBadge(a.available_quantity)}</td>
+      <td class="px-5 py-3.5">
+        <div class="flex justify-end gap-2">
+          ${isManagerView
+            ? `<button data-action="open-props" data-asset-id="${a.id}" class="rounded-md px-2.5 py-1.5 text-[12px] font-medium text-slate-400 underline-offset-2 transition hover:text-blue-400 hover:underline">View Pool details</button>`
+            : `<button data-action="open-props" data-asset-id="${a.id}" class="rounded-md border border-border px-2.5 py-1.5 text-[12px] font-medium text-slate-300 transition hover:border-slate-500 hover:text-white">Properties Hub</button>`}
+          <button data-action="open-dispatch" data-asset-id="${a.id}" data-asset-name="${escapeHtml(a.name)}" data-available="${a.available_quantity}" class="rounded-md bg-blue-600/90 px-2.5 py-1.5 text-[12px] font-medium text-white transition hover:bg-blue-500">Issue / Dispatch</button>
+        </div>
+      </td>
+    </tr>`).join('') || `<tr><td colspan="4" class="px-5 py-6 text-center text-slate-500">No asset pools found.</td></tr>`;
+
+  renderPaginationBar('assets', total, startIndex, pageRows.length);
+}
+registerRenderer('assets', renderAssetsTable);
+
+// ---- Dispatch (Issue / Checkout) drawer ----
+
+// Operations & Observability requirement #4: client-side min/max date
+// validation. Keeps this in one place so it can't drift out of sync with
+// the backend's matching check in schemas/assets.py's
+// AdvancedCheckoutRequest._validate_due_date (which enforces the SAME
+// rule server-side -- this client-side version is purely a UX nicety that
+// stops the browser's own date picker from ever offering an invalid date
+// in the first place; it is NOT the actual security boundary).
+const MAX_DUE_DATE_YEARS_AHEAD = 5;
+
+function todayAsInputValue() {
+  // <input type="date"> wants "YYYY-MM-DD" in the LOCAL timezone -- using
+  // toISOString() directly here would be wrong for anyone west of UTC
+  // (it could show "yesterday" as the earliest selectable date right
+  // after midnight local time), so we build the string from local
+  // getFullYear/getMonth/getDate instead.
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function applyDueDateBounds(inputEl) {
+  if (!inputEl) return;
+  const today = new Date();
+  const min = todayAsInputValue();
+  const maxDate = new Date(today.getFullYear() + MAX_DUE_DATE_YEARS_AHEAD, today.getMonth(), today.getDate());
+  const max = `${maxDate.getFullYear()}-${String(maxDate.getMonth() + 1).padStart(2, '0')}-${String(maxDate.getDate()).padStart(2, '0')}`;
+  inputEl.min = min;
+  inputEl.max = max;
+}
+
+export function openDispatchModal(assetId, assetName, available) {
+  currentDispatchAssetId = assetId;
+  document.getElementById('dispatchAssetName').textContent = `${assetName} · ${available} available`;
+  document.getElementById('dispatchForm').reset();
+  // Re-applied every time the drawer opens (rather than once at page load)
+  // so "today" is always correct even if the dashboard has been left open
+  // across midnight.
+  applyDueDateBounds(document.getElementById('dispatchDueDate'));
+  toggleRoute();
+  openModal('dispatchModal');
+}
+
+export async function submitDispatchForm(event) {
+  event.preventDefault();
+  if (!currentDispatchAssetId) return;
+
+  const routeVal = document.getElementById('routeSelect').value;
+  const quantity = parseInt(document.getElementById('dispatchQuantity').value, 10) || 1;
+  const dueDate = document.getElementById('dispatchDueDate').value || null;
+
+  let payload = { quantity, due_date: dueDate };
+
+  // NOTE: this dispatch form is shared identically by admin.html AND
+  // manager.html -- Managers get all three "Assign To" routes (Staff,
+  // Linked Customer Account, Ad-Hoc Individual) exactly like a Super
+  // Admin, enforced by the backend's `require_privileged_role` on
+  // POST /assets/{id}/checkout_advanced (see backend/api/assets.py).
+  if (routeVal === 'staff') {
+    payload.assignee_type = 'user';
+    payload.user_id = parseInt(document.getElementById('staffSelect').value, 10);
+  } else if (routeVal === 'customer') {
+    // Simplified: a "Linked Customer Account" is stored the same way as an
+    // ad-hoc outsider, just without a company name field of its own.
+    payload.assignee_type = 'outsider';
+    payload.outsider_name = document.getElementById('customerName').value;
+    payload.outsider_contact = 'Linked customer account';
+  } else {
+    payload.assignee_type = 'outsider';
+    payload.outsider_name = document.getElementById('adhocName').value;
+    payload.outsider_company = document.getElementById('adhocCompany').value;
+    payload.outsider_contact = document.getElementById('adhocContact').value;
+  }
+
+  try {
+    const result = await apiRequest(`/assets/${currentDispatchAssetId}/checkout_advanced`, {
+      method: 'POST', body: JSON.stringify(payload),
+    });
+    alert(result.message);
+    closeModal('dispatchModal');
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ---- Properties Hub / Asset Pool Details modal ----
+export async function openPropsModal(assetId) {
+  currentPropsAssetId = assetId;
+  try {
+    const details = await apiRequest(`/assets/${assetId}/details`);
+    document.getElementById('propsAssetName').textContent = details.name;
+    document.getElementById('propsTotal').textContent = details.total_quantity;
+    document.getElementById('propsAvailable').textContent = details.available_quantity;
+    // Outbound + Isolated now come straight from the backend's derived
+    // Available = Total - Outbound - Isolated calculation (requirement #3)
+    // instead of being re-derived here from possibly-stale numbers.
+    document.getElementById('propsOutbound').textContent = details.outbound_quantity;
+    document.getElementById('propsRepair').textContent = details.isolated_quantity;
+
+    const capacityInput = document.getElementById('capacityInput');
+    if (capacityInput) capacityInput.value = details.total_quantity;
+
+    const list = document.getElementById('propsDeploymentList');
+    list.innerHTML = details.active_assignments.map(a => `
+    <div class="flex items-center justify-between rounded-lg border border-border bg-card2/50 px-3 py-2.5">
+      <div>
+        <p class="text-[13px] font-medium text-slate-200">${escapeHtml(a.assignee_name)} <span class="text-slate-500">(${escapeHtml(a.assignee_type)})</span></p>
+        <p class="text-[11px] text-slate-500">Outstanding ${a.outstanding} / ${a.quantity} · due ${escapeHtml(a.due_date)}</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <input type="number" min="1" max="${a.outstanding}" value="${a.outstanding}" id="returnQty-${a.checkout_id}"
+          class="w-16 rounded-md border border-border bg-card2 px-2 py-1.5 text-[12px] text-slate-200 outline-none focus:border-emerald-500/60" />
+        <button data-action="process-return" data-checkout-id="${a.checkout_id}" class="rounded-md bg-emerald-600/90 px-2.5 py-1.5 text-[11px] font-semibold text-white transition hover:bg-emerald-500">Process Return</button>
+      </div>
+    </div>`).join('') || `<p class="text-[12px] text-slate-500">No active deployments for this pool.</p>`;
+
+    // Isolated units (Under Repair / Stolen / Missing) with a Recall
+    // action -- requirement #3's "Recall and Update" workflow.
+    const isolatedItems = [...details.under_repair_items, ...details.stolen_items];
+    const isolatedList = document.getElementById('propsIsolatedList');
+    if (isolatedList) {
+      isolatedList.innerHTML = isolatedItems.map(item => `
+    <div class="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2.5">
+      <div>
+        <p class="tag-mono text-[12px] font-medium text-slate-200">${escapeHtml(item.serial)}</p>
+        <p class="text-[11px] text-slate-500">${escapeHtml(item.notes || 'No notes on file')}</p>
+      </div>
+      <button data-action="recall-exception" data-asset-id="${assetId}" data-exception-id="${item.exception_id}" class="rounded-md border border-emerald-500/40 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-400 transition hover:bg-emerald-500/10">Recall to Service</button>
+    </div>`).join('') || `<p class="text-[12px] text-slate-500">No isolated units for this pool.</p>`;
+    }
+
+    openModal('propsModal');
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ---- Recall an isolated unit (Under Repair / Stolen) back into service ----
+export async function recallException(assetId, exceptionId) {
+  try {
+    const result = await apiRequest(`/assets/${assetId}/exception/${exceptionId}/recall`, { method: 'POST' });
+    alert(result.message);
+    openPropsModal(assetId);
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+export async function saveCapacity() {
+  const newTotal = parseInt(document.getElementById('capacityInput').value, 10);
+  try {
+    await apiRequest(`/assets/${currentPropsAssetId}/quantity`, {
+      method: 'PUT', body: JSON.stringify({ new_total: newTotal }),
+    });
+    toggleCapacityEdit();
+    openPropsModal(currentPropsAssetId);
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+export async function submitExceptionForm(event) {
+  event.preventDefault();
+  const payload = {
+    serial_number: document.getElementById('exceptionSerial').value,
+    status_label: document.getElementById('exceptionStatus').value,
+    notes: document.getElementById('exceptionNotes').value,
+  };
+  try {
+    await apiRequest(`/assets/${currentPropsAssetId}/exception`, { method: 'POST', body: JSON.stringify(payload) });
+    document.getElementById('exceptionForm').reset();
+    openPropsModal(currentPropsAssetId);
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ---- Register New Inventory Pool (Super Admin only) ----
+export async function submitCreatePoolForm(event) {
+  event.preventDefault();
+  const payload = {
+    name: document.getElementById('newPoolName').value,
+    total_quantity: parseInt(document.getElementById('newPoolQty').value, 10),
+  };
+  try {
+    await apiRequest('/assets', { method: 'POST', body: JSON.stringify(payload) });
+    document.getElementById('createPoolForm').reset();
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// ---- Spreadsheet Batch Import (Super Admin only) ----
+export async function submitCsvImportForm(event) {
+  event.preventDefault();
+  const fileInput = document.getElementById('csvFileInput');
+  if (!fileInput.files.length) return;
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  try {
+    const result = await apiRequest('/assets/import', { method: 'POST', body: formData });
+
+    // Data Quality & Usability requirement #5: the backend no longer
+    // silently skips bad rows -- it returns a full diagnostic report
+    // (`result.errors`) of exactly which rows were rejected and why. We
+    // surface that here instead of only showing the success message, so a
+    // Super Admin can immediately go fix the specific rows rather than
+    // wondering why the imported count came in lower than the file's row
+    // count.
+    if (result.errors && result.errors.length) {
+      const preview = result.errors
+        .slice(0, 10)
+        .map(e => `Row ${e.row}${e.name ? ` (${e.name})` : ''}: ${e.reason}`)
+        .join('\n');
+      const more = result.errors.length > 10
+        ? `\n…and ${result.errors.length - 10} more rejected row(s).`
+        : '';
+      alert(`${result.message}\n\nRejected rows:\n${preview}${more}`);
+    } else {
+      alert(result.message);
+    }
+    fileInput.value = '';
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
