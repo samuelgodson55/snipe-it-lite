@@ -1,0 +1,38 @@
+services:
+  # 1. The FastAPI Backend Service
+  - type: web
+    name: snipeit-lite-backend
+    env: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: snipeit-lite-db
+          property: connectionString
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_FORMAT
+        value: json
+
+  # 2. The Frontend Static Site
+  - type: web
+    name: snipeit-lite-frontend
+    env: static
+    buildCommand: ""
+    staticPublishPath: frontend
+    headers:
+      - path: "/*"
+        name: Access-Control-Allow-Origin
+        value: "*"
+
+databases:
+  # 3. The Managed PostgreSQL Database
+  - name: snipeit-lite-db
+    plan: free
+    postgresMajorVersion: 16
