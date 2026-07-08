@@ -125,7 +125,7 @@ services:
       - key: SUPER_ADMIN_NAME
         value: Super Admin
       - key: SUPER_ADMIN_PASSWORD
-        generateValue: false
+        generateValue: true
 
   # ---------------------------------------------------------------------
   # Frontend: the nginx reverse proxy + static site (frontend/*.html, js/*)
