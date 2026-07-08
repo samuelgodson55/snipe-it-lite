@@ -69,7 +69,7 @@ services:
     runtime: docker
     dockerfilePath: backend/Dockerfile
     dockerContext: backend
-    plan: starter
+    plan: free
     region: oregon # Must match the frontend service's region -- see below.
     envVars:
       # PORT is what Render uses to know which port to route to (surfaced
@@ -164,7 +164,7 @@ services:
     dockerfilePath: backend/Dockerfile
     dockerContext: backend
     dockerCommand: celery -A celery_app worker --loglevel=info --concurrency=2
-    plan: starter
+    plan: free
     region: oregon # Must match backend/redis's region.
     envVars:
       - key: ENVIRONMENT
@@ -208,7 +208,7 @@ services:
     runtime: docker
     dockerfilePath: nginx/Dockerfile
     dockerContext: . # Repo root -- Dockerfile also COPYs frontend/ from here.
-    plan: starter
+    plan: free
     region: oregon # Must match the backend service's region -- private
                    # networking (and therefore this whole setup) only
                    # works within a single Render region.
