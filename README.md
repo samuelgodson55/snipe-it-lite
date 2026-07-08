@@ -187,9 +187,12 @@ Click your name in the navbar on any dashboard to:
   human-readable **details** string. A return entry specifically also
   names **who the equipment was returned from** — a linked User (name +
   email) or an unlinked ad-hoc Outsider (name, and company if known).
-- Exportable as CSV (streamed, for very large date ranges) or PDF
-  (printable summary). A Manager only ever sees/exports entries they
-  personally generated; a Super Admin sees everything.
+- Exportable as CSV or PDF. Export generation runs on a background
+  Celery worker (see [Tech Stack](#tech-stack)) rather than inline in the
+  request — clicking "Export" enqueues a job and polls it to completion
+  before downloading, so a wide date range never risks tying up the API
+  or timing out the browser. A Manager only ever sees/exports entries
+  they personally generated; a Super Admin sees everything.
 
 ### Account Security (built-in, mostly invisible until you need it)
 
@@ -210,7 +213,8 @@ Click your name in the navbar on any dashboard to:
 - **Backend:** Python 3.11, FastAPI, SQLAlchemy 2.0, PostgreSQL 16,
   Alembic (migrations), PyJWT (session tokens), `pwdlib`/Argon2id
   (password hashing), Pydantic Settings v2 (typed config), `reportlab`
-  (PDF generation for exports).
+  (PDF generation for exports), Celery + Redis (background workers for
+  audit-ledger exports — see below).
 - **Frontend:** Plain HTML + vanilla JS ES Modules — **no React/Vue, no
   app build step** — styled with Tailwind CSS, compiled locally ahead of
   time to a single static `frontend/css/tailwind.css` (see
@@ -219,10 +223,12 @@ Click your name in the navbar on any dashboard to:
   Served by an nginx reverse proxy built from
   [`nginx/Dockerfile`](nginx/Dockerfile) (see
   [Deploying Across Environments](#deploying-across-environments-nginx-reverse-proxy)).
-- **Infra:** Docker Compose, 3 services: `db` (Postgres), `backend`
-  (FastAPI/uvicorn, not exposed to the host), `frontend` (nginx —
-  serves the static site AND reverse-proxies `/api/*` to `backend`,
-  the only publicly-exposed service).
+- **Infra:** Docker Compose, 5 services: `db` (Postgres), `redis`
+  (Celery broker/result backend, not exposed to the host), `backend`
+  (FastAPI/uvicorn, not exposed to the host), `worker` (Celery — builds
+  audit-ledger CSV/PDF exports out-of-band, not exposed to the host),
+  `frontend` (nginx — serves the static site AND reverse-proxies
+  `/api/*` to `backend`, the only publicly-exposed service).
 
 Because `frontend/css/tailwind.css` is a plain committed file (not
 generated inside the Docker build), **editing an `.html` or `.js` file
@@ -236,8 +242,8 @@ one CSS file — see that folder's README for the one-line command.
 
 ```
 snipe-it-lite/
-├── docker-compose.yml        # 3 services: db, backend, frontend
-├── render.yaml                # Render Blueprint -- deploys all 3 tiers, see
+├── docker-compose.yml        # 5 services: db, redis, backend, worker, frontend
+├── render.yaml                # Render Blueprint -- deploys all tiers, see
 │                                # "Deploying Across Environments" section above
 ├── .env.example               # Copy this to .env and fill in real secrets
 ├── .gitignore                 # Keeps .env (and other junk) out of git
@@ -261,8 +267,17 @@ snipe-it-lite/
 │   ├── security.py                    # Password hashing, password policy, JWT
 │   ├── deps.py                         # get_current_user / role-gate dependencies
 │   ├── logging_config.py                # Structured (JSON) logging setup
+│   ├── celery_app.py                      # Celery app: Redis broker/result backend
+│   │                                        # for async exports -- shared by `backend`
+│   │                                        # (producer) and `worker` (consumer)
 │   ├── requirements.txt                  # Python dependencies
-│   ├── Dockerfile                         # Backend container build
+│   ├── Dockerfile                         # Backend container build (also used,
+│   │                                        # unmodified, by the `worker` service --
+│   │                                        # see docker-compose.yml)
+│   │
+│   ├── tasks/                     # Celery tasks -- run on the `worker` container
+│   │   └── export_tasks.py          # generate_audit_export(): builds the CSV/PDF
+│   │                                  # off the request/response cycle
 │   │
 │   ├── middleware/                # ASGI middleware, one concern per file
 │   │   ├── request_context.py       # Request Correlation ID (X-Request-ID)
@@ -412,7 +427,7 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 #    - Pick a real POSTGRES_PASSWORD and update DATABASE_URL in .env to match
 #      (the placeholder password appears in BOTH places -- keep them in sync).
 
-# 2. Build and start everything (Postgres, backend, frontend)
+# 2. Build and start everything (Postgres, Redis, backend, worker, frontend)
 docker compose up --build
 
 # 3. Open the app -- everything is served from ONE origin now, via the
@@ -545,6 +560,28 @@ together automatically:
       confirm `/api/*` calls succeed (open your browser's Network tab —
       you should see `200`s from `/api/auth/login` etc., not connection
       errors or `405`s).
+
+> **Troubleshooting: "I edited `render.yaml` but the new env var never
+> shows up on the service."** This almost always means that particular
+> service isn't actually linked to the Blueprint — usually because it was
+> created by hand first (see the manual path below), before `render.yaml`
+> existed, or during earlier trial and error. Blueprint sync only pushes
+> `render.yaml` changes to resources it created and owns; a manually
+> created service ignores the file entirely, silently. **Tell the two
+> apart from the Render Dashboard**: a Blueprint-owned service's type
+> matches `render.yaml` exactly — the backend must read **Private
+> Service**, not **Web Service** (if the backend's dashboard tab/header
+> says "Web Service" or it has a public `onrender.com` URL, it was created
+> manually and is not the resource `render.yaml` deploys to). Two ways to
+> fix a service stuck in this state:
+> 1. **(Recommended)** Delete the manually created service(s) and deploy
+>    fresh via **New → Blueprint** as described above, so Render creates
+>    all three resources from `render.yaml` and they stay in sync going
+>    forward.
+> 2. Or, keep the manual service and set `SUPER_ADMIN_PASSWORD` (and
+>    `JWT_SECRET_KEY`, `SUPER_ADMIN_USERNAME`, etc.) directly on it, by
+>    hand, under that service's **Environment** tab — `generateValue: true`
+>    only has any effect for variables Blueprint sync itself manages.
 
 <details>
 <summary>Prefer to set services up manually instead of via Blueprint? Click to expand.</summary>
@@ -781,6 +818,7 @@ losing data.
 ```bash
 # Inside the backend container (or a local venv with the same DATABASE_URL):
 cd backend
+docker compose exec backend alembic upgrade head
 alembic upgrade head              # apply all migrations
 alembic revision --autogenerate -m "add some_column"   # after editing models.py
 ```
@@ -792,14 +830,59 @@ disable it (`AUTO_INIT_DB=false`) and let `alembic upgrade head` be the
 only thing that ever changes your schema.
 
 **Current migrations:**
-- `0001_baseline_schema.py` — the original table set.
-- `0002_add_account_lockout_fields.py` — adds
-  `users.failed_login_attempts` and `users.locked_until`.
+- `0001_baseline_schema.py` — the **only** migration. Creates every table
+  in its full, current shape (matching `models.py` exactly) in one file —
+  there's no `0002`/`0003`/... chain to apply on top of it. A fresh
+  `alembic upgrade head` against an empty database only ever runs this
+  one file.
+
+> **Note on history:** this project briefly had an incremental chain
+> (`0002_add_account_lockout_fields`, `0003_timezone_aware_datetimes`,
+> `0004_add_username_to_users`, `0005_soft_delete_asset_types`) written as
+> `models.py` evolved. Those were squashed back into a single
+> `0001_baseline_schema.py` for a cleaner fresh-install experience — five
+> files (and the schema-drift risk of one of them going missing, as
+> happened before) is unnecessary overhead for a project with no shipped
+> production data yet.
+>
+> **If your database was already migrated with the old 0001–0005 chain**
+> (check with `alembic current` — if it shows anything other than
+> `0001_baseline_schema`), do **not** just run `alembic upgrade head`;
+> Alembic will look for migration files that no longer exist and error
+> out. Since your tables already match the new baseline's schema exactly,
+> just re-point Alembic's bookkeeping at it instead, without touching any
+> table:
+> ```bash
+> alembic stamp 0001_baseline_schema
+> ```
+> Fresh installs (empty/nonexistent database) don't need this — just run
+> `alembic upgrade head` as normal.
+
+**Going forward, every schema change should be its own NEW migration**
+(via `alembic revision --autogenerate -m "description"`) layered on top of
+`0001_baseline_schema.py` — don't keep hand-editing the baseline itself
+once any real data exists anywhere.
 
 **When you add a new column to `models.py`, always write a migration for
 it** (either by hand or via `alembic revision --autogenerate`) — don't
 rely on `create_all()` alone, since it will never alter an *existing*
 table that's missing a new column.
+
+**Running `alembic upgrade head` only needs `DATABASE_URL`.** `backend/alembic/env.py`
+reads its own minimal settings object for exactly that one variable — it
+deliberately does **not** import `config.py`'s full `Settings` object,
+because that object's startup checks refuse to even construct themselves
+when `ENVIRONMENT=production` unless `JWT_SECRET_KEY` and
+`SUPER_ADMIN_PASSWORD` are *also* already set to real values (see the
+Security Model section). Those checks are correct for the running app
+(`main.py`), but migrations have nothing to do with either secret, so
+requiring them just to run `alembic upgrade head` created a chicken-and-egg
+problem: every alembic command failed with a `pydantic.ValidationError`
+traceback (`Refusing to start: ENVIRONMENT=production but JWT_SECRET_KEY/
+SUPER_ADMIN_PASSWORD is still empty...`) regardless of what you actually
+ran it with. If you still see that error, it means `DATABASE_URL` itself
+is missing/wrong (or you're on a checkout from before this fix) — check
+that first rather than the JWT/Super Admin variables.
 
 ## Full API Reference
 
@@ -837,7 +920,9 @@ once the backend is running. This table is the high-level map:
 | `POST /checkouts/{id}/return` | Super Admin / Admin / Manager | Process a (partial or full) return. |
 | `GET /checkouts/overdue` | Super Admin / Admin / Manager | Dashboard alert feed of overdue checkouts. |
 | `GET /audit-logs` | Super Admin / Admin / Manager | TRUE server-side paginated audit ledger — `?limit=&offset=` (no search param; see [Feature Tour](#feature-tour)). |
-| `GET /audit-logs/export` | Super Admin / Admin / Manager | Download the ledger as `?format=csv` (default, streamed) or `?format=pdf`. |
+| `POST /audit-logs/export` | Super Admin / Admin / Manager | Enqueue a background export job — `?format=csv` (default) or `?format=pdf`, plus optional `?start_date=&end_date=`. Returns `{task_id, status}` immediately; does not return the file. |
+| `GET /audit-logs/export/{task_id}/status` | Super Admin / Admin / Manager | Poll a job's progress — `{state, ready, error?}`. |
+| `GET /audit-logs/export/{task_id}/download` | Super Admin / Admin / Manager | Download the finished file once `status` reports `SUCCESS` (409 if not ready yet, 404 if the task_id is unknown/expired). |
 | `GET /health` | anyone | Trivial liveness check for Docker/orchestrators. |
 
 **Every export endpoint** accepts `?format=csv` or `?format=pdf` and

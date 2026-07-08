@@ -89,17 +89,22 @@ def _filtered_audit_logs_query(db: Session, user: dict, start_date: Optional[dat
 
 def export_audit_logs_csv(db: Session, user: dict, start_date: Optional[datetime.date], end_date: Optional[datetime.date]):
     """
-    Returns a generator of CSV rows (streamed by the router via
-    StreamingResponse) for the same filtered set of logs as get_audit_logs,
-    optionally narrowed further by a start/end date range.
+    Returns a generator of CSV rows for the same filtered set of logs as
+    get_audit_logs, optionally narrowed further by a start/end date range.
 
-    NOTE: the CSV export deliberately does NOT apply limit/offset -- a
-    "give me everything in this date range as a file" export is a
-    fundamentally different operation from "show me a page of rows in the
-    UI", and streaming the response row-by-row (see `generate_csv()` below)
-    means it never has to hold the whole result set in memory at once
-    anyway, so there's no unbounded-memory risk to guard against here the
-    way there is for the JSON listing endpoints.
+    Generation now happens inside `tasks.export_tasks.generate_audit_export`
+    on the Celery `worker` container (see api/audit.py's module docstring
+    for why), which drains this generator into one in-memory buffer rather
+    than streaming it straight into an HTTP response the way the old
+    synchronous `GET /audit-logs/export` router handler used to via
+    StreamingResponse -- there's no HTTP response for a background job to
+    stream into. It stays a generator (rather than building one big string
+    up front) anyway, since that's still the cheaper way to assemble it row
+    by row regardless of what ultimately consumes it.
+
+    NOTE: this deliberately does NOT apply limit/offset -- a "give me
+    everything in this date range as a file" export is a fundamentally
+    different operation from "show me a page of rows in the UI".
     """
     logs = _filtered_audit_logs_query(db, user, start_date, end_date).all()
 

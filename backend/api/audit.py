@@ -1,17 +1,37 @@
 """
 api/audit.py
 ------------
-GET /audit-logs, GET /audit-logs/export.
+GET /audit-logs, plus the async export job trio:
+  POST /audit-logs/export                    -- enqueue a CSV/PDF export job
+  GET  /audit-logs/export/{task_id}/status   -- poll a job's progress
+  GET  /audit-logs/export/{task_id}/download -- fetch the finished file
+
+WHY ASYNC?
+----------
+The audit ledger is the one dataset in this app guaranteed to grow without
+bound (see services/audit_service.py's module docstring) -- a Super Admin
+exporting a wide date range as a PDF could take long enough to generate
+that it isn't safe to build inline in a single request/response cycle
+(it would tie up an API worker process, and risks the browser/proxy
+timing the request out before the file is ready). Generation now happens
+out-of-band on a separate `worker` container running Celery (see
+celery_app.py and tasks/export_tasks.py) -- this router's job is just to
+enqueue that work and let the frontend poll for it, never to build the
+file itself.
 """
 
+import base64
 import datetime
 from typing import Optional
+
+from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from celery_app import celery_app
 from database import get_db
 from deps import require_privileged_role
+from tasks.export_tasks import generate_audit_export
 import services.audit_service as audit_service
 
 router = APIRouter(prefix="/audit-logs", tags=["audit"])
@@ -27,25 +47,82 @@ def get_audit_logs(
     return audit_service.get_audit_logs(db, user, limit, offset)
 
 
-@router.get("/export")
-def export_audit_logs(
-    format: str = Query("csv", description="Export format: 'csv' (streamed, default) or 'pdf'."),
+@router.post("/export")
+def start_audit_export(
+    format: str = Query("csv", description="Export format: 'csv' or 'pdf'."),
     start_date: Optional[datetime.date] = Query(None),
     end_date: Optional[datetime.date] = Query(None),
-    db: Session = Depends(get_db),
     user: dict = Depends(require_privileged_role),
 ):
+    """
+    Enqueues a `generate_audit_export` job on the Celery worker and
+    immediately returns its task_id -- this endpoint never blocks waiting
+    for the file itself. `user["role"]`/`user["email"]` come off the
+    already-validated JWT (see deps.require_privileged_role), NOT from
+    anything the caller can directly control, so the worker task re-derives
+    the same Manager-vs-Admin/Super-Admin scoping
+    `audit_service.get_audit_logs` enforces on the synchronous listing
+    endpoint above -- a Manager's export job can only ever see entries
+    they personally generated, exactly like their UI table does.
+    """
     fmt = format.lower()
-    today = datetime.date.today()
-
-    if fmt == "pdf":
-        pdf_bytes = audit_service.export_audit_logs_pdf(db, user, start_date, end_date)
-        headers = {"Content-Disposition": f"attachment; filename=audit_export_{today}.pdf"}
-        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-
-    if fmt != "csv":
+    if fmt not in ("csv", "pdf"):
         raise HTTPException(status_code=400, detail="format must be 'csv' or 'pdf'.")
 
-    csv_stream = audit_service.export_audit_logs_csv(db, user, start_date, end_date)
-    headers = {"Content-Disposition": f"attachment; filename=audit_export_{today}.csv"}
-    return StreamingResponse(csv_stream, media_type="text/csv", headers=headers)
+    task = generate_audit_export.delay(
+        requested_by_email=user["email"],
+        requested_by_role=user["role"],
+        fmt=fmt,
+        start_date_iso=start_date.isoformat() if start_date else None,
+        end_date_iso=end_date.isoformat() if end_date else None,
+    )
+    return {"task_id": task.id, "status": "queued"}
+
+
+@router.get("/export/{task_id}/status")
+def get_audit_export_status(task_id: str, user: dict = Depends(require_privileged_role)):
+    """
+    Cheap poll endpoint the frontend calls every second or two after
+    starting an export (see js/components/audit.js). Deliberately does NOT
+    require the polling user to be the same one who started the job --
+    task_id is an unguessable UUID and every caller here already has to
+    hold a valid privileged-role session anyway, same trust boundary as
+    the rest of this router.
+    """
+    result = AsyncResult(task_id, app=celery_app)
+    if result.state == "PENDING":
+        # Celery reports state as PENDING both for "still queued/running"
+        # AND for "no such task_id has ever existed" -- it never persists
+        # a distinct "unknown" state. That ambiguity is fine here: either
+        # way, the correct response to the frontend is "not ready yet".
+        return {"state": "PENDING", "ready": False}
+    if result.state == "FAILURE":
+        return {"state": "FAILURE", "ready": True, "error": str(result.result)}
+    if result.state == "SUCCESS":
+        return {"state": "SUCCESS", "ready": True}
+    # STARTED / RETRY / any other in-progress Celery state.
+    return {"state": result.state, "ready": False}
+
+
+@router.get("/export/{task_id}/download")
+def download_audit_export(task_id: str, user: dict = Depends(require_privileged_role)):
+    """
+    Returns the finished file for a completed export job. 409s if the job
+    hasn't finished yet (the frontend is expected to have already polled
+    .../status to SUCCESS before calling this) and 404s if the task_id is
+    unknown or its result already expired out of Redis (see
+    settings.EXPORT_RESULT_TTL_SECONDS).
+    """
+    result = AsyncResult(task_id, app=celery_app)
+    if result.state == "FAILURE":
+        raise HTTPException(status_code=500, detail=f"Export failed: {result.result}")
+    if result.state != "SUCCESS":
+        raise HTTPException(status_code=409, detail="Export is not ready yet.")
+
+    payload = result.result
+    if not payload:
+        raise HTTPException(status_code=404, detail="Export result not found -- it may have expired. Please start a new export.")
+
+    file_bytes = base64.b64decode(payload["content_b64"])
+    headers = {"Content-Disposition": f"attachment; filename={payload['filename']}"}
+    return Response(content=file_bytes, media_type=payload["content_type"], headers=headers)

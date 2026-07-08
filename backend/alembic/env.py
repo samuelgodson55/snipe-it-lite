@@ -15,18 +15,48 @@ from alembic import context
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import Base  # noqa: E402  (import after sys.path tweak, on purpose)
-from config import settings  # noqa: E402
+from pydantic_settings import BaseSettings, SettingsConfigDict  # noqa: E402
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
 
-# Inject the real database URL from our central `settings` object
-# (backend/config.py -> reads DATABASE_URL from the environment / .env
-# file) instead of the placeholder left in alembic.ini. This is the "link
-# env.py to the existing SQLAlchemy database models" step from the setup
-# instructions in README.md.
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+# -----------------------------------------------------------------------------
+# BUG FIX (was: `from config import settings`):
+#
+# backend/config.py's `Settings` class runs two `model_validator` startup
+# checks (`_enforce_prod_jwt_secret` / `_enforce_prod_super_admin_password`)
+# the INSTANT it's instantiated, which happens at module import time -- i.e.
+# the moment this file did `from config import settings`. Those checks
+# refuse to construct `Settings()` at all if ENVIRONMENT=production and
+# JWT_SECRET_KEY/SUPER_ADMIN_PASSWORD aren't yet set to real values.
+#
+# That's exactly the right behavior for the actual app (main.py) -- it
+# should never boot with forgeable secrets. But it made `alembic upgrade
+# head` (and every other alembic subcommand) impossible to run before those
+# unrelated app secrets existed: migrations only need DATABASE_URL, so
+# requiring the JWT secret and Super Admin password just to connect and
+# apply schema changes was a chicken-and-egg problem that failed with a
+# cryptic pydantic ValidationError on every single invocation, regardless
+# of the command.
+#
+# The fix: define a second, minimal settings class here that reads ONLY
+# `DATABASE_URL` (same `.env` file support as the real one) and has none of
+# `Settings`'s production-secret validators.
+# -----------------------------------------------------------------------------
+class _MigrationSettings(BaseSettings):
+    DATABASE_URL: str = "postgresql://admin:supersecret@db:5432/asset_db"
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+
+db_settings = _MigrationSettings()
+
+# Inject the real database URL (env var / .env file) instead of the
+# placeholder left in alembic.ini. This is the "link env.py to the existing
+# SQLAlchemy database models" step from the setup instructions in README.md.
+config.set_main_option("sqlalchemy.url", db_settings.DATABASE_URL)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

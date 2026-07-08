@@ -85,6 +85,29 @@ class Settings(BaseSettings):
     # lets them reach each other by service name.
     DATABASE_URL: str = "postgresql://admin:supersecret@db:5432/asset_db"
 
+    # --- Async export workers (Celery + Redis) -----------------------------
+    # CSV/PDF ledger exports used to be generated synchronously, inline in
+    # the request/response cycle -- fine for a small date range, but a
+    # Super Admin exporting months of the (unbounded, append-only) audit
+    # ledger as a PDF could tie up an API worker process for a long time
+    # building it. Generation now happens in a separate `celery` worker
+    # process/container (see backend/celery_app.py, backend/tasks/, and the
+    # `worker` service in docker-compose.yml); the API only ever enqueues a
+    # job and polls/returns its result.
+    #
+    # REDIS_URL is used as BOTH the Celery broker (where jobs queue up) and
+    # the Celery result backend (where a finished job's file bytes are
+    # stashed, base64-encoded, until the frontend downloads them). "redis"
+    # is the docker-compose service name below, same pattern as
+    # DATABASE_URL's "db" hostname above.
+    REDIS_URL: str = "redis://redis:6379/0"
+    # How long a finished export's result (and its file bytes) stays in
+    # Redis before expiring, in seconds. Long enough for a normal
+    # "click export, wait a few seconds, download" flow with some slack
+    # for a slow connection; short enough that finished export files
+    # don't sit in Redis forever if nobody downloads them.
+    EXPORT_RESULT_TTL_SECONDS: int = 3600
+
     # --- JWT / Auth -----------------------------------------------------
     JWT_SECRET_KEY: str = "dev-secret-change-me-in-production"
     JWT_ALGORITHM: str = "HS256"

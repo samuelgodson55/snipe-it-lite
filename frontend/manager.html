@@ -363,6 +363,12 @@
             <option value="50">50</option>
           </select>
         </div>
+        <!-- Exports now run on a background worker instead of inline in
+             the request (see js/components/audit.js) -- this span shows
+             that job's queued/generating/ready progress next to the
+             buttons instead of leaving them looking frozen while the
+             worker builds the file. -->
+        <span id="auditExportStatus" class="text-[12px] text-slate-500"></span>
         <button id="exportAuditBtn" class="flex items-center gap-1.5 rounded-md border border-border bg-card2 px-3 py-1.5 text-[12px] font-medium text-slate-300 transition hover:border-blue-500/50 hover:text-blue-400">
           <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15V3"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>
           Export Ledger (.CSV)

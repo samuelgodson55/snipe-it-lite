@@ -1,10 +1,15 @@
 // =============================================================================
 // js/components/audit.js
 // -----------------------------------------------------------------------------
-// Audit Trail table + the "Export Audit Ledger CSV" action. The export is
-// the one place the frontend needs a raw (non-JSON) authenticated fetch, so
-// it uses `API_URL` + the session token directly rather than `apiRequest`
-// (which assumes a JSON or passthrough-Response result, not a file download).
+// Audit Trail table + the "Export Audit Ledger" (CSV/PDF) action.
+//
+// EXPORTS ARE ASYNC (run on a background Celery worker, not inline in the
+// request -- see backend/tasks/export_tasks.py and backend/api/audit.py):
+// `exportAuditLogs()` below enqueues a job, polls its status, then
+// downloads the finished file once ready. The final download step is the
+// one place this file needs a raw (non-JSON) authenticated fetch, so it
+// uses `API_URL` + the session token directly rather than `apiRequest`
+// (which assumes a JSON or passthrough-Response result, not a file blob).
 //
 // PAGINATION NOTE (Data Quality & Usability requirement #4): the audit
 // ledger is genuinely unbounded (it's an append-only log that grows for
@@ -25,7 +30,7 @@
 
 import { apiRequest, API_URL } from '../api.js';
 import { getSession } from '../auth.js';
-import { escapeHtml, renderServerPaginationBar } from '../ui.js';
+import { escapeHtml, formatTimestamp, renderServerPaginationBar } from '../ui.js';
 
 const auditState = { page: 1, perPage: 10, total: 0 };
 
@@ -39,7 +44,7 @@ export async function loadAuditLogs() {
 
     tbody.innerHTML = result.items.map(l => `
     <tr>
-      <td class="px-5 py-2.5 whitespace-nowrap">${escapeHtml(l.timestamp)}</td>
+      <td class="px-5 py-2.5 whitespace-nowrap" title="${escapeHtml(l.timestamp)}">${escapeHtml(formatTimestamp(l.timestamp))}</td>
       <td class="px-5 py-2.5">${escapeHtml(l.operator)}</td>
       <td class="px-5 py-2.5"><span class="rounded bg-blue-500/10 px-1.5 py-0.5 text-blue-400 ring-1 ring-blue-500/30">${escapeHtml(l.action)}</span></td>
       <td class="px-5 py-2.5 text-slate-500">${escapeHtml(l.details)}</td>
@@ -67,13 +72,36 @@ export function setAuditPerPage(value) {
 }
 
 // ---- Export Audit Ledger (CSV or PDF) ----
-// Prompts the user for an optional start/end date range before exporting,
-// and forwards them to GET /audit-logs/export?format=&start_date=&end_date=.
-// This intentionally bypasses auditState/limit/offset entirely -- exporting
-// "everything in this date range" is a different operation from paging
-// through the UI. The CSV branch streams row-by-row on the backend (see
-// services/audit_service.py); the PDF branch is built as one file, so both
-// share this same "narrow it to a date range first" prompt flow.
+// Prompts the user for an optional start/end date range, then runs the
+// whole export as a background job instead of generating the file inline
+// in one request:
+//   1. POST /audit-logs/export?format=&start_date=&end_date= enqueues the
+//      job on the Celery worker (see backend/tasks/export_tasks.py) and
+//      returns a task_id immediately -- it does NOT wait for the file.
+//   2. We poll GET /audit-logs/export/{task_id}/status every 1.2s,
+//      updating the small status text next to the buttons so the UI never
+//      just sits there looking frozen while the worker builds the file
+//      (this matters most for a wide date-range PDF of an unbounded
+//      ledger, which is exactly the case that used to risk tying up the
+//      request for a long time).
+//   3. Once status is SUCCESS, we fetch the finished file from
+//      .../download (a raw, non-JSON response -- same reason this file
+//      already uses `API_URL` + the session token directly rather than
+//      `apiRequest`) and trigger the browser download.
+const EXPORT_POLL_INTERVAL_MS = 1200;
+const EXPORT_POLL_TIMEOUT_MS = 5 * 60 * 1000; // give up politely after 5 minutes
+
+function setExportStatus(text, isError = false) {
+  const el = document.getElementById('auditExportStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.className = `text-[12px] ${isError ? 'text-rose-400' : 'text-slate-500'}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function exportAuditLogs(format = 'csv') {
   try {
     const startDate = prompt('Export from which date? (YYYY-MM-DD, leave blank for "no start limit")', '');
@@ -85,21 +113,53 @@ export async function exportAuditLogs(format = 'csv') {
     if (startDate.trim()) params.set('start_date', startDate.trim());
     if (endDate.trim()) params.set('end_date', endDate.trim());
     params.set('format', format);
-    const query = `?${params.toString()}`;
 
-    const session = getSession();
-    const response = await fetch(`${API_URL}/audit-logs/export${query}`, {
-      headers: { 'Authorization': `Bearer ${session.token}` },
-    });
-    if (!response.ok) throw new Error('Export failed. Check the date format (YYYY-MM-DD) and try again.');
-    const blob = await response.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `audit_export_${new Date().toISOString().slice(0, 10)}.${format}`;
-    a.click();
-    window.URL.revokeObjectURL(url);
+    setExportStatus('Queuing export…');
+    const { task_id } = await apiRequest(`/audit-logs/export?${params.toString()}`, { method: 'POST' });
+
+    const deadline = Date.now() + EXPORT_POLL_TIMEOUT_MS;
+    while (true) {
+      const status = await apiRequest(`/audit-logs/export/${task_id}/status`);
+
+      if (status.state === 'SUCCESS') {
+        setExportStatus('Downloading…');
+        await downloadFinishedExport(task_id, format);
+        setExportStatus('Export ready.');
+        setTimeout(() => setExportStatus(''), 4000);
+        return;
+      }
+      if (status.state === 'FAILURE') {
+        throw new Error(status.error || 'Export failed on the server.');
+      }
+      if (Date.now() > deadline) {
+        throw new Error('Export is taking longer than expected. Please try again shortly.');
+      }
+
+      setExportStatus(status.state === 'STARTED' ? 'Generating file…' : 'Waiting for a worker…');
+      await sleep(EXPORT_POLL_INTERVAL_MS);
+    }
   } catch (err) {
+    setExportStatus(err.message, true);
     alert(err.message);
   }
+}
+
+// Fetches the finished file for a completed export job and triggers a
+// browser download. Kept separate from `apiRequest` (same reason the CSV
+// export always was) because the response body here is a raw file blob,
+// not JSON.
+async function downloadFinishedExport(taskId, format) {
+  const session = getSession();
+  const response = await fetch(`${API_URL}/audit-logs/export/${taskId}/download`, {
+    headers: { 'Authorization': `Bearer ${session.token}` },
+  });
+  if (!response.ok) throw new Error('The finished export could not be downloaded. Please try exporting again.');
+
+  const blob = await response.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `audit_export_${new Date().toISOString().slice(0, 10)}.${format}`;
+  a.click();
+  window.URL.revokeObjectURL(url);
 }

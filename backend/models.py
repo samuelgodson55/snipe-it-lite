@@ -40,12 +40,9 @@ timezone-aware `datetime` stamped as UTC. Never call the bare
 UTC but isn't labelled as such) -- see services/*.py and security.py for
 where this function is imported and reused instead.
 
-An existing database created before this change stored plain (naive)
-`TIMESTAMP` columns. See `alembic/versions/0003_timezone_aware_datetimes.py`
-for the migration that converts every existing column to `TIMESTAMPTZ` and
-tells Postgres to treat the old naive values as UTC (which is safe, because
-`get_utc_now()`/`utc_now()` was already always writing UTC -- it just
-wasn't labelling it as such).
+Every table is created with these `TIMESTAMPTZ` columns from the start —
+see `alembic/versions/0001_baseline_schema.py`, the project's single
+baseline migration.
 """
 
 import datetime
@@ -141,12 +138,11 @@ class User(Base):
     # Auto-derived from the local part of the email address the FIRST time
     # an account is created (see services/user_service.py's
     # `_derive_username()`), e.g. "t.okafor@corp.io" -> "t.okafor". Kept
-    # `nullable=True` purely so this column can be added to an existing
-    # database via Alembic without breaking any row that already exists
-    # (see the backfill step in
-    # alembic/versions/0004_add_username_to_users.py) -- every account
-    # created from this point forward always gets one. `POST /auth/login`
-    # accepts EITHER this value or the email address interchangeably.
+    # `nullable=True` since this column is created fresh (nothing to
+    # backfill) by `alembic/versions/0001_baseline_schema.py`, the
+    # project's single baseline migration -- every account created from
+    # this point forward always gets one. `POST /auth/login` accepts
+    # EITHER this value or the email address interchangeably.
     username = Column(String, unique=True, index=True, nullable=True)
 
     # "admin" | "manager" | "staff" | "customer" -- NEVER "super_admin".

@@ -2,9 +2,10 @@
 # render.yaml
 # -----------------------------------------------------------------------------
 # Render "Blueprint" (Infrastructure as Code) for Snipe-IT Lite. Deploys the
-# exact same three-tier shape described in README.md's "Deploying Across
-# Environments" section -- a Postgres database, a private FastAPI backend,
-# and a public nginx reverse-proxy/frontend -- with zero manual dashboard
+# same shape described in README.md's "Deploying Across Environments"
+# section -- a Postgres database, a Redis instance, a private FastAPI
+# backend, a private Celery worker (async audit-ledger exports), and a
+# public nginx reverse-proxy/frontend -- with zero manual dashboard
 # copy-pasting required. See:
 #   https://render.com/docs/blueprint-spec
 #   https://render.com/docs/infrastructure-as-code
@@ -45,6 +46,19 @@ databases:
 
 services:
   # ---------------------------------------------------------------------
+  # Redis: Celery broker + result backend for async audit-ledger exports
+  # (see backend/celery_app.py). Private only -- neither the backend nor
+  # the worker service below need it reachable from the public internet,
+  # matching docker-compose.yml's redis service having no host `ports:`
+  # mapping either.
+  # ---------------------------------------------------------------------
+  - type: redis
+    name: snipeit-lite-redis
+    plan: free
+    ipAllowList: [] # Empty list = no public access, private-network only.
+    region: oregon # Must match backend/worker's region -- see below.
+
+  # ---------------------------------------------------------------------
   # Backend: FastAPI, as a PRIVATE service (no public onrender.com URL --
   # matches docker-compose.yml's "backend has no host `ports:` mapping"
   # setup). Only the frontend/nginx service below can reach it, over
@@ -68,6 +82,14 @@ services:
       - key: DATABASE_URL
         fromDatabase:
           name: snipeit-lite-db
+          property: connectionString
+      # Broker + result backend for the async export job system -- see
+      # backend/celery_app.py. Shared with the `snipeit-lite-worker`
+      # service below, which is what actually consumes these jobs.
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: snipeit-lite-redis
           property: connectionString
       - key: JWT_SECRET_KEY
         generateValue: true # Random 256-bit value -- comfortably over the
@@ -126,6 +148,54 @@ services:
         value: Super Admin
       - key: SUPER_ADMIN_PASSWORD
         generateValue: true
+
+  # ---------------------------------------------------------------------
+  # Worker: same image as the backend (same Dockerfile/build context), but
+  # runs a Celery worker process instead of uvicorn -- see the `worker`
+  # service in docker-compose.yml for the equivalent local setup and
+  # backend/tasks/export_tasks.py for what it actually runs. Private only,
+  # like the backend: nothing outside Render's internal network (not even
+  # the frontend) ever talks to this service directly, only via the Redis
+  # job queue both it and the backend share.
+  # ---------------------------------------------------------------------
+  - type: pserv
+    name: snipeit-lite-worker
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    dockerCommand: celery -A celery_app worker --loglevel=info --concurrency=2
+    plan: starter
+    region: oregon # Must match backend/redis's region.
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: snipeit-lite-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: snipeit-lite-redis
+          property: connectionString
+      # The worker never issues/verifies JWTs itself (see
+      # backend/tasks/export_tasks.py's docstring), but config.py's
+      # Settings() still requires a value to construct at all since it
+      # shares the same config module as the backend. Generated
+      # independently here -- it doesn't need to match the backend's own
+      # JWT_SECRET_KEY, since the worker never decodes a token with it.
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_FORMAT
+        value: json
+      # The worker never runs migrations/seeding -- the backend service
+      # already owns that on its own startup hook.
+      - key: AUTO_INIT_DB
+        value: false
+      - key: AUTO_SEED_DEMO_DATA
+        value: false
 
   # ---------------------------------------------------------------------
   # Frontend: the nginx reverse proxy + static site (frontend/*.html, js/*)

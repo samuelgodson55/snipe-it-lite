@@ -53,6 +53,25 @@ export function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Turns a backend ISO-8601 timestamp (e.g.
+// "2026-07-08T07:58:40.216313+00:00") into a short, human-friendly string
+// for on-screen tables (e.g. "Jul 8, 2026, 7:58 AM") -- the raw ISO string
+// (microseconds + numeric UTC offset included) is what the API returns and
+// is fine for the CSV/PDF exports, but it's unreadable/overflow-prone in
+// the UI table, which only has room for a glance-able value. Falls back to
+// the original string if it's not a value `Date` can parse, so a malformed
+// or already-friendly timestamp still renders as *something* instead of
+// blank.
+export function formatTimestamp(isoString) {
+  if (!isoString) return '';
+  const d = new Date(isoString);
+  if (Number.isNaN(d.getTime())) return isoString;
+  return d.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
+}
+
 export function switchTab(tab) {
   const assets = document.getElementById('assetInventorySection');
   const users = document.getElementById('userDirectorySection');

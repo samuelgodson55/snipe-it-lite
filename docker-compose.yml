@@ -56,6 +56,33 @@ services:
       timeout: 5s
       retries: 5
 
+  # ---------------------------------------------------------------------
+  # redis (Celery broker + result backend for async exports)
+  # ---------------------------------------------------------------------
+  # Two jobs: (1) the queue the `backend` container drops export jobs
+  # into, and (2) where the `worker` container stashes a finished job's
+  # file bytes until the frontend downloads them (see
+  # backend/celery_app.py's module docstring for the full picture, and
+  # config.py's EXPORT_RESULT_TTL_SECONDS for how long results live here
+  # before expiring). Not published to the host -- like `db`, it's only
+  # ever reached over Compose's internal network, by service name.
+  redis:
+    image: redis:7-alpine
+    container_name: snipeit_lite_redis
+    restart: unless-stopped
+    volumes:
+      # Named volume so queued-but-not-yet-processed jobs and any
+      # not-yet-downloaded export results survive a `docker compose
+      # restart`. Redis's default persistence (RDB snapshots) is enabled
+      # out of the box in this image, which is all this workload needs --
+      # a lost job here just means re-clicking "export", not lost data.
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   backend:
     build: ./backend
     container_name: snipeit_lite_backend
@@ -70,6 +97,11 @@ services:
       # "db" works because Docker Compose puts every service on the same
       # network and lets them reach each other by service name.
       DATABASE_URL: ${DATABASE_URL:-postgresql://admin:supersecret@db:5432/asset_db}
+      # Broker + result backend for the async export job system (see
+      # backend/celery_app.py) -- "redis" is the service name below,
+      # resolved by Compose's internal DNS the same way "db" is for
+      # Postgres.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your .env file -- see .env.example}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-12}
@@ -109,6 +141,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     # NOTE: no host `ports:` mapping here anymore -- see nginx reverse-proxy
     # comment block below for why. The backend is still fully reachable by
     # the frontend container over Compose's internal network at
@@ -117,6 +151,51 @@ services:
     # curling it, or Postman), temporarily add back:
     #     ports:
     #       - "8000:8000"
+
+  # ---------------------------------------------------------------------
+  # worker (Celery consumer -- generates audit ledger CSV/PDF exports)
+  # ---------------------------------------------------------------------
+  # Same image/build context as `backend` (identical requirements.txt, so
+  # it has reportlab/celery/redis/SQLAlchemy available and can import
+  # services/audit_service.py directly) -- the only thing that differs is
+  # the `command:` below, which runs a Celery worker process instead of
+  # uvicorn. This is what actually executes `tasks.generate_audit_export`
+  # jobs the `backend` container enqueues via POST /audit-logs/export; see
+  # backend/celery_app.py and backend/tasks/export_tasks.py.
+  #
+  # Talks to the SAME Postgres database as `backend` (it needs to query
+  # the audit_logs table itself) and the SAME Redis instance (as the
+  # queue it consumes from and where it stashes finished results) -- so it
+  # gets an almost-identical environment block. Not published to the host
+  # at all: nothing outside this Compose network ever talks to a worker
+  # directly, only via the job queue.
+  worker:
+    build: ./backend
+    container_name: snipeit_lite_worker
+    restart: unless-stopped
+    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://admin:supersecret@db:5432/asset_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # The worker never issues/verifies JWTs itself (export jobs are
+      # enqueued with an already-validated user's role/email baked in --
+      # see api/audit.py), but Settings() still requires a JWT_SECRET_KEY
+      # value to construct without error since it shares config.py with
+      # the backend, so it needs the same one set here.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your .env file -- see .env.example}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      # The worker never runs its own DB migrations/seeding -- `backend`
+      # already owns that on its startup hook -- so these stay disabled
+      # here regardless of the .env values used for `backend`.
+      AUTO_INIT_DB: "false"
+      AUTO_SEED_DEMO_DATA: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------
   # frontend / nginx reverse proxy (requirement: multi-tier deployment)
@@ -165,3 +244,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
