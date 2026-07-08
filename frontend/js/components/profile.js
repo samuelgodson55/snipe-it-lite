@@ -17,8 +17,12 @@ import { openModal, closeModal } from '../ui.js';
 import { getSession } from '../auth.js';
 
 // Human-friendly labels for the raw role strings the backend uses.
-const ROLE_LABELS = {
+// Exported so main.js can reuse the exact same mapping for the navbar's
+// quick role label (see main.js's DOMContentLoaded handler) instead of
+// drifting out of sync with a second, hand-maintained copy.
+export const ROLE_LABELS = {
   super_admin: 'Super Admin',
+  admin: 'Admin',
   manager: 'Manager',
   staff: 'Staff',
   customer: 'Customer',

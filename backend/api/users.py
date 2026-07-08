@@ -5,6 +5,7 @@ System-user account provisioning, directory listing, self-service items,
 per-user custody lookup, properties-assigned exports, and delete.
 """
 
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
@@ -40,10 +41,11 @@ def create_user(req: UserCreateRequest, db: Session = Depends(get_db), user: dic
 def get_users(
     limit: int = Query(user_service.DEFAULT_LIMIT, ge=1, le=user_service.MAX_LIMIT, description="Max rows to return"),
     offset: int = Query(0, ge=0, description="Rows to skip (for paging through a large directory)"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match against name, email, role, department, or department_role"),
     db: Session = Depends(get_db),
     user: dict = Depends(require_privileged_role),
 ):
-    return user_service.list_users(db, user, limit, offset)
+    return user_service.list_users(db, user, limit, offset, search)
 
 
 @router.get("/me/items")

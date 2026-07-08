@@ -20,16 +20,29 @@ Authentication model:
     is calling and what they're allowed to do.
 
 Role model:
-  - "super_admin" -> full access to everything.
+  - "super_admin" -> full access to everything. NOT a database row -- this
+                     is a single hardcoded root identity configured via the
+                     SUPER_ADMIN_USERNAME/SUPER_ADMIN_PASSWORD environment
+                     variables (see config.py and security.py's
+                     super_admin_principal()). Exactly one exists, always;
+                     it can never be created, edited, or deleted through
+                     the app, and it never appears in the User Directory or
+                     any other listing (see deps.py + services/auth_service.py
+                     + services/user_service.py for where this is enforced).
+  - "admin"       -> a normal, database-backed account with every privilege
+                     "super_admin" has (see deps.py's _FULL_ADMIN_ROLES) --
+                     the difference is purely how the account exists
+                     (editable/deletable `users` row vs. the one hardcoded
+                     identity above), never what it's allowed to do.
   - "manager"     -> can view inventory, dispatch/check-in items to ANY of
                      the three channels (Staff, Linked Customers, or Ad-Hoc
                      Individuals), and view + manage custody for users in
                      their own department. Can ALSO provision new Staff and
                      Customer login accounts (see POST /users), but can
-                     never provision another Manager or Super Admin account.
+                     never provision another Manager or Admin account.
                      Still cannot create/delete asset pools, cannot adjust
                      pool capacity, and cannot flag maintenance exceptions --
-                     those remain Super Admin-only.
+                     those remain Super Admin/Admin-only.
   - "staff"       -> a regular employee record. Has a read-only self-service
                      dashboard (staff.html) showing only their own custody.
   - "customer"    -> an external contact with a login. Has a read-only
@@ -65,7 +78,18 @@ from api.audit import router as audit_router
 configure_logging(settings)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Custom Snipe-IT API")
+app = FastAPI(
+    title="Custom Snipe-IT API",
+    # SECURITY: when settings.ENABLE_API_DOCS is False (set this in any
+    # environment reachable from the public internet -- see config.py's
+    # ENABLE_API_DOCS docstring), passing None here doesn't just hide these
+    # pages behind a login or a "hidden" URL -- FastAPI skips generating
+    # the OpenAPI schema and never registers these routes at all, so
+    # requesting them returns a plain 404 like any other nonexistent path.
+    docs_url="/docs" if settings.ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if settings.ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if settings.ENABLE_API_DOCS else None,
+)
 
 
 # ---------------------------------------------------------------------------

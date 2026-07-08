@@ -49,6 +49,19 @@ _INSECURE_JWT_SECRETS = {
 }
 _MIN_PROD_JWT_SECRET_LENGTH = 32
 
+# Same idea as _INSECURE_JWT_SECRETS above, but for the hardcoded Super
+# Admin's password (see the SUPER_ADMIN_* settings below and
+# security.py's super_admin_principal()). If ANY of these is still the
+# active SUPER_ADMIN_PASSWORD while ENVIRONMENT=production, anyone who has
+# read this public repo can log in as the one account that can never be
+# deleted and always has full privileges.
+_INSECURE_SUPER_ADMIN_PASSWORDS = {
+    "",
+    "change-this-super-admin-password",
+    "RootAccess123!",
+}
+_MIN_PROD_SUPER_ADMIN_PASSWORD_LENGTH = 12
+
 
 class Settings(BaseSettings):
     """
@@ -134,6 +147,52 @@ class Settings(BaseSettings):
     ACCOUNT_LOCKOUT_MAX_ATTEMPTS: int = 5
     ACCOUNT_LOCKOUT_DURATION_MINUTES: int = 15
 
+    # --- API documentation exposure (SECURITY) -----------------------------
+    # Controls whether FastAPI's interactive docs (/docs -- Swagger UI),
+    # /redoc, and the raw machine-readable schema (/openapi.json) exist at
+    # all. Defaults to True so local `docker compose up` still gives you the
+    # handy interactive docs at http://localhost:8080/docs out of the box.
+    #
+    # In Render or any other environment reachable from the public internet,
+    # set this to "false". This is read by BOTH layers that currently expose
+    # these routes, as defense in depth:
+    #   1. backend/main.py passes it into FastAPI's docs_url/redoc_url/
+    #      openapi_url constructor args -- when disabled, FastAPI doesn't
+    #      just hide the UI, it never generates or serves the schema at all,
+    #      so there's no lower-effort way to reconstruct your entire API
+    #      surface (every route, every request/response field) than just
+    #      reading this repo's source, which is no worse than any other
+    #      open-source app.
+    #   2. nginx/default.conf.template ALSO gates its own /docs, /redoc, and
+    #      /openapi.json proxy block on this same flag (via the identically-
+    #      named ENABLE_API_DOCS variable passed to the frontend container --
+    #      see docker-compose.yml/render.yaml), so a misconfigured or
+    #      out-of-date backend doesn't become the only thing standing
+    #      between these routes and the public internet.
+    ENABLE_API_DOCS: bool = True
+
+    # --- Hardcoded Super Admin (root account) ------------------------------
+    # Unlike every other role (manager/admin/staff/customer), "super_admin"
+    # is NOT a row in the `users` table -- it's a single fixed identity
+    # defined entirely by these three settings, checked directly against
+    # the login form's `identifier` field before the database is ever
+    # queried (see services/auth_service.py -> login()). This is what
+    # guarantees there is always EXACTLY one Super Admin, that it can never
+    # be created/edited/deleted through the app (there's no row to delete),
+    # and that it never shows up in the User Directory or any other listing
+    # (those all query the `users` table, which this account never touches).
+    #
+    # SUPER_ADMIN_PASSWORD has NO safe built-in default the way most other
+    # settings do -- see _enforce_prod_super_admin_password below, which
+    # refuses to boot in production if this is still empty or one of the
+    # obviously-public placeholder values. Locally, leave it unset (or use
+    # the placeholder in .env.example) and this login path simply won't
+    # activate -- normal DB-backed accounts (see database.py's seed_db())
+    # still work fine without it.
+    SUPER_ADMIN_USERNAME: str = "superadmin"
+    SUPER_ADMIN_NAME: str = "Super Admin"
+    SUPER_ADMIN_PASSWORD: str = ""
+
     # Tell Pydantic Settings v2 to also look for a `.env` file (useful when
     # running the backend directly with `uvicorn main:app` outside Docker,
     # where environment variables aren't injected by docker-compose.yml).
@@ -176,6 +235,37 @@ class Settings(BaseSettings):
                 f"{len(self.JWT_SECRET_KEY)} character(s) long. It must be at least "
                 f"{_MIN_PROD_JWT_SECRET_LENGTH} characters of random data, e.g.: "
                 'python3 -c "import secrets; print(secrets.token_hex(32))"'
+            )
+
+        return self
+
+    # -----------------------------------------------------------------
+    # STARTUP CHECK: hardcoded Super Admin password
+    # -----------------------------------------------------------------
+    # Same rationale as _enforce_prod_jwt_secret above: refuse to boot in
+    # production if SUPER_ADMIN_PASSWORD is still empty or a placeholder
+    # value anyone can read straight out of this public repo. Unlike the
+    # JWT secret, this one is allowed to be empty/placeholder in
+    # development -- an empty value simply disables the Super Admin login
+    # path entirely (see auth_service.py -> login()), rather than logging
+    # anyone in with a blank password.
+    @model_validator(mode="after")
+    def _enforce_prod_super_admin_password(self) -> "Settings":
+        if not self.is_production:
+            return self
+
+        if self.SUPER_ADMIN_PASSWORD in _INSECURE_SUPER_ADMIN_PASSWORDS:
+            raise ValueError(
+                "Refusing to start: ENVIRONMENT=production but SUPER_ADMIN_PASSWORD is "
+                "still empty or a placeholder/default value. Set a real, unique password "
+                "for the hardcoded Super Admin account in your environment/.env file."
+            )
+
+        if len(self.SUPER_ADMIN_PASSWORD) < _MIN_PROD_SUPER_ADMIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"Refusing to start: ENVIRONMENT=production but SUPER_ADMIN_PASSWORD is "
+                f"only {len(self.SUPER_ADMIN_PASSWORD)} character(s) long. It must be at "
+                f"least {_MIN_PROD_SUPER_ADMIN_PASSWORD_LENGTH} characters long."
             )
 
         return self

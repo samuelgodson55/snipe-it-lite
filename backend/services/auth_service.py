@@ -14,7 +14,15 @@ from sqlalchemy import or_
 import models
 from models import utc_now
 from config import settings
-from security import hash_password, verify_password, create_access_token
+from security import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    SUPER_ADMIN_ID,
+    SUPER_ADMIN_ROLE,
+    SUPER_ADMIN_PASSWORD_HASH,
+    super_admin_principal,
+)
 from schemas.auth import LoginRequest, PasswordUpdateRequest
 
 logger = logging.getLogger(__name__)
@@ -52,6 +60,36 @@ def login(db: Session, req: LoginRequest) -> dict:
     # account-specific complement to it -- it stops an attacker who spreads
     # guesses across many IPs from ever brute-forcing one specific account.
     identifier = req.identifier.strip()
+
+    # --- Hardcoded Super Admin login path -----------------------------
+    # Checked FIRST, before the `users` table is ever touched. This is a
+    # single fixed identity built from SUPER_ADMIN_USERNAME/
+    # SUPER_ADMIN_PASSWORD (see config.py + security.py's
+    # super_admin_principal()), not a database row -- see that module's
+    # docstring for the full rationale (exactly one Super Admin, never
+    # deletable, never listed anywhere). If SUPER_ADMIN_PASSWORD is unset,
+    # SUPER_ADMIN_PASSWORD_HASH is None and this path is fully disabled --
+    # `identifier == settings.SUPER_ADMIN_USERNAME` alone is never enough
+    # to authenticate.
+    if SUPER_ADMIN_PASSWORD_HASH and identifier == settings.SUPER_ADMIN_USERNAME:
+        if not verify_password(req.password, SUPER_ADMIN_PASSWORD_HASH):
+            logger.warning("Login failed: Super Admin, wrong password")
+            raise HTTPException(status_code=401, detail="Invalid email/username or password.")
+
+        principal = super_admin_principal()
+        token = create_access_token(principal)
+        logger.info("Login succeeded", extra={"user": principal.email, "role": SUPER_ADMIN_ROLE, "user_id": SUPER_ADMIN_ID})
+        return {
+            "message": "Authentication successful.",
+            "user_id": SUPER_ADMIN_ID,
+            "name": principal.name,
+            "username": principal.username,
+            "role": SUPER_ADMIN_ROLE,
+            "department": None,
+            "token": token,
+            "needs_password_reset": False,
+        }
+
     user = db.query(models.User).filter(
         or_(models.User.email == identifier, models.User.username == identifier),
         models.User.is_active == True,
@@ -140,6 +178,19 @@ def get_profile(db: Session, current_user: dict) -> dict:
     even stored in the JWT at all -- see security.py's create_access_token
     -- or a `department` a Super Admin edited after this session started).
     """
+    if current_user.get("role") == SUPER_ADMIN_ROLE and str(current_user.get("sub")) == str(SUPER_ADMIN_ID):
+        # Not a database row -- rehydrate straight from the JWT's own
+        # claims (identical to what login() issued) instead of querying.
+        return {
+            "id": SUPER_ADMIN_ID,
+            "name": current_user.get("name"),
+            "email": current_user.get("email"),
+            "username": current_user.get("username"),
+            "role": SUPER_ADMIN_ROLE,
+            "department": None,
+            "department_role": None,
+        }
+
     user = db.query(models.User).filter(models.User.id == int(current_user["sub"])).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
@@ -155,9 +206,21 @@ def get_profile(db: Session, current_user: dict) -> dict:
 
 
 def update_password(db: Session, req: PasswordUpdateRequest, current_user: dict) -> dict:
-    # A user may only reset their own password unless they are a super admin.
+    # The hardcoded Super Admin's password lives only in the
+    # SUPER_ADMIN_PASSWORD environment variable (see config.py) -- it has
+    # no `users` table row to update, so it can never be changed from
+    # within the app itself, by anyone, including itself. Change it by
+    # updating the environment and restarting the backend instead.
+    if req.user_id == SUPER_ADMIN_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="The Super Admin password is set via the server environment and cannot be changed from the app.",
+        )
+
+    # A user may only reset their own password unless they are an Admin or
+    # the Super Admin.
     is_self_service = str(req.user_id) == current_user["sub"]
-    if not is_self_service and current_user["role"] != "super_admin":
+    if not is_self_service and current_user["role"] not in ("super_admin", "admin"):
         raise HTTPException(status_code=403, detail="You may only update your own password.")
 
     target = db.query(models.User).filter(

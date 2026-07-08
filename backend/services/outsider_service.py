@@ -10,12 +10,14 @@ Ledger experience for them. Used by api/outsiders.py.
 """
 
 import datetime
+from typing import Optional
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 import models
 import services.export_service as export_service
+from services.search_utils import apply_search_filter
 
 # Same reasoning as user_service.DEFAULT_LIMIT/MAX_LIMIT -- bounds how many
 # ad-hoc profiles a single request can return (Data Quality & Usability
@@ -24,7 +26,7 @@ DEFAULT_LIMIT = 500
 MAX_LIMIT = 1000
 
 
-def list_outsiders(db: Session, limit: int = DEFAULT_LIMIT, offset: int = 0) -> dict:
+def list_outsiders(db: Session, limit: int = DEFAULT_LIMIT, offset: int = 0, search: Optional[str] = None) -> dict:
     """
     Lists every ad-hoc/unlinked individual who currently has (or has ever
     had) items dispatched to them, along with how many units are presently
@@ -32,14 +34,22 @@ def list_outsiders(db: Session, limit: int = DEFAULT_LIMIT, offset: int = 0) -> 
     same access tier as the regular User Directory (see manager.html's
     "Ad-Hoc Individuals" tab, added alongside "Team Allocation Matrix").
 
-    PAGINATION: same pattern as user_service.list_users -- count the total
-    BEFORE slicing, then only compute the (per-row) `outstanding_items`
-    aggregation for the page actually being returned.
+    PAGINATION + SEARCH: same pattern as user_service.list_users -- `search`
+    (when present) narrows the directory to rows where name, contact
+    details, or company case-insensitively contains it (the same fields
+    the Ad-Hoc Directory table's search box has always searched by, see
+    js/components/outsiders.js), applied and counted BEFORE slicing, then
+    the (per-row) `outstanding_items` aggregation is only computed for the
+    page actually being returned.
     """
     limit = max(1, min(limit, MAX_LIMIT))
     offset = max(0, offset)
 
-    query = db.query(models.Outsider).order_by(models.Outsider.id)
+    query = db.query(models.Outsider)
+    query = apply_search_filter(query, search, [
+        models.Outsider.name, models.Outsider.contact_details, models.Outsider.company,
+    ])
+    query = query.order_by(models.Outsider.id)
     total = query.count()
     outsiders = query.offset(offset).limit(limit).all()
 

@@ -35,18 +35,20 @@ unconditionally to a JSON API like this one.
 
 WHAT THIS DOES **NOT** COVER
 -------------------------------
-This does NOT set a `Content-Security-Policy` (CSP) or
-`Strict-Transport-Security` (HSTS) header:
-  - A good CSP is highly specific to your actual frontend (which CDNs,
-    inline scripts, etc. it uses) -- setting a generic one here could
-    silently BREAK the frontend rather than protect it. Configuring CSP is
-    listed as a suggested future feature in README.md instead, to be tuned
-    against your real deployed frontend.
-  - HSTS ("always use HTTPS") only makes sense once you're actually serving
-    this over HTTPS with a real certificate (e.g. behind a reverse proxy /
-    load balancer in production) -- setting it over plain local HTTP in
-    docker-compose would do nothing useful. Add it in your reverse proxy
-    config (nginx/Caddy/your cloud load balancer) once you deploy with TLS.
+This does NOT set a `Content-Security-Policy` (CSP) header here:
+  - This backend is a pure JSON API -- it never returns HTML/CSS/JS for a
+    browser to render, so a CSP here would do nothing useful. The actual
+    frontend (the HTML/JS/CSS nginx serves) gets a real CSP, tuned against
+    its exact CDN/script/font usage, at the reverse-proxy layer instead --
+    see `nginx/default.conf.template`'s `Content-Security-Policy` header
+    and its accompanying comment for the full breakdown of each directive.
+  - Nor does it set `Strict-Transport-Security` (HSTS): that only makes
+    sense once you're actually serving this over HTTPS with a real
+    certificate (e.g. behind a reverse proxy / load balancer in
+    production) -- setting it over plain local HTTP in docker-compose
+    would do nothing useful. Add it in your reverse proxy config
+    (nginx/Caddy/your cloud load balancer) once you deploy with TLS -- see
+    "Suggested Future Features" in README.md.
 """
 
 from starlette.types import ASGIApp, Receive, Scope, Send

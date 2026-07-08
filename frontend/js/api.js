@@ -9,11 +9,21 @@
 // one raw-blob download in components/audit.js) from here instead of calling
 // `fetch()` itself, so there's exactly one place that knows the backend's
 // base URL and exactly one place that knows how 401s should be handled.
+//
+// API_URL IS A RELATIVE PATH ON PURPOSE -- see nginx/default.conf.template.
+// This app is always served BY the same nginx reverse proxy that also
+// forwards /api/* to the FastAPI backend under the hood. That means this
+// file never needs to know the backend's real hostname, and never needs to
+// change between local Docker Compose, Render, and cloud -- nginx is the
+// only thing that knows where the backend actually lives in each
+// environment. Do NOT hardcode a host/port here; if you ever need to point
+// this frontend at a backend that ISN'T behind this same reverse proxy,
+// fix that in nginx (BACKEND_HOST/BACKEND_PORT), not here.
 // =============================================================================
 
 import { getSession, logout } from './auth.js';
 
-export const API_URL = 'http://127.0.0.1:8000'; // Change to your FastAPI backend URL if different
+export const API_URL = '/api';
 
 // Small fetch wrapper that automatically attaches the Authorization header
 // and JSON-parses the response, throwing a readable Error on failure.

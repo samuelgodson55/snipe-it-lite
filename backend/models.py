@@ -149,7 +149,12 @@ class User(Base):
     # accepts EITHER this value or the email address interchangeably.
     username = Column(String, unique=True, index=True, nullable=True)
 
-    role = Column(String, default="staff")  # "super_admin" | "manager" | "staff"
+    # "admin" | "manager" | "staff" | "customer" -- NEVER "super_admin".
+    # That role is reserved for the single hardcoded root identity (see
+    # security.py's super_admin_principal()) and is never stored as a
+    # database row; services/user_service.py's create_user() enforces
+    # this at the API layer too.
+    role = Column(String, default="staff")
     password_hash = Column(String, nullable=False)
     is_verified = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)

@@ -7,47 +7,53 @@
 
 import { apiRequest } from '../api.js';
 import { getSession } from '../auth.js';
-import { escapeHtml, tableState, registerRenderer, filterAndPaginate, renderPaginationBar } from '../ui.js';
+import { escapeHtml, debounce, renderServerPaginationBar } from '../ui.js';
 import { refreshDashboard } from '../dashboard.js';
+
+// TRUE server-side search + pagination (same pattern as components/
+// audit.js's `auditState` / components/assets.js's `assetsState`): every
+// keystroke in the search box (debounced), page turn, or "rows per page"
+// change re-fetches just that slice from `GET /users?search=&limit=&
+// offset=` instead of re-filtering an already-downloaded array.
+const usersState = { page: 1, perPage: 10, search: '', total: 0 };
 
 // ---- User Directory / Team Allocation Matrix table ----
 export async function loadUsers() {
   const tbody = document.getElementById('userTableBody');
   if (!tbody) return;
   try {
-    // GET /users now returns a paginated envelope --
-    // { items, total, limit, offset } -- instead of a bare array (Data
-    // Quality & Usability requirement #4). A generous limit keeps the
-    // existing client-side search/pagination (js/ui.js's
-    // filterAndPaginate()) behaving exactly as before for realistic
-    // directory sizes, while the backend still enforces a hard cap.
-    const result = await apiRequest('/users?limit=1000');
-    const users = result.items;
-    tableState.users.raw = users;
-    renderUsersTable();
+    const offset = (usersState.page - 1) * usersState.perPage;
+    const params = new URLSearchParams({ limit: usersState.perPage, offset });
+    if (usersState.search.trim()) params.set('search', usersState.search.trim());
+    const result = await apiRequest(`/users?${params.toString()}`);
+    usersState.total = result.total;
+    renderUsersTable(result.items);
 
     // Also populate the "Assign To > Staff Member" dropdown in the dispatch
-    // drawer. This ALWAYS uses the full unfiltered list (not the paginated
-    // page), because it's a dropdown of dispatch targets, not a table to
-    // page through -- filtering/paginating it would hide valid recipients.
+    // drawer. This is a SEPARATE, unpaginated/unfiltered fetch (rather than
+    // reusing `result.items` above) because it's a dropdown of every valid
+    // dispatch recipient, not a table to page/search through -- reusing
+    // the current page's search-narrowed slice would hide valid recipients
+    // the moment a Super Admin/Manager typed anything into the User
+    // Directory's search box.
     const staffSelect = document.getElementById('staffSelect');
     if (staffSelect) {
-      staffSelect.innerHTML = users.map(u => `<option value="${u.id}">${escapeHtml(u.name)} (${escapeHtml(u.department_role || u.role)})</option>`).join('');
+      const roster = await apiRequest('/users?limit=1000');
+      staffSelect.innerHTML = roster.items.map(u => `<option value="${u.id}">${escapeHtml(u.name)} (${escapeHtml(u.department_role || u.role)})</option>`).join('');
     }
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="4" class="px-5 py-6 text-center text-rose-400">${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-export function renderUsersTable() {
+function renderUsersTable(users) {
   const tbody = document.getElementById('userTableBody');
   if (!tbody) return;
   const isManagerView = document.body.dataset.view === 'manager';
 
-  const { pageRows, total, startIndex } = filterAndPaginate('users', ['name', 'email', 'role', 'department_role', 'department']);
-  document.querySelectorAll('.user-count').forEach(el => el.textContent = total);
+  document.querySelectorAll('.user-count').forEach(el => el.textContent = usersState.total);
 
-  tbody.innerHTML = pageRows.map(u => {
+  tbody.innerHTML = users.map(u => {
     const initials = u.name.split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase();
     // `checkout_count` comes straight from the backend (GET /users), which
     // sums up the outstanding quantity across that user's active checkouts.
@@ -78,9 +84,30 @@ export function renderUsersTable() {
     </tr>`;
   }).join('') || `<tr><td colspan="4" class="px-5 py-6 text-center text-slate-500">No accounts found.</td></tr>`;
 
-  renderPaginationBar('users', total, startIndex, pageRows.length);
+  renderServerPaginationBar('users', usersState);
 }
-registerRenderer('users', renderUsersTable);
+
+// Called from the search box's 'input' listener (main.js), debounced.
+export const setUsersSearch = debounce((value) => {
+  usersState.search = value;
+  usersState.page = 1; // always jump back to page 1 on a new search
+  loadUsers();
+});
+
+// Called from the "Rows per page" <select>'s 'change' listener (main.js).
+export function setUsersPerPage(value) {
+  usersState.perPage = parseInt(value, 10) || 10;
+  usersState.page = 1;
+  loadUsers();
+}
+
+// Called by main.js's delegated click handler when Prev/Next is clicked.
+export function changeUsersPage(delta) {
+  const nextPage = usersState.page + delta;
+  if (nextPage < 1) return;
+  usersState.page = nextPage;
+  loadUsers();
+}
 
 // ---- Delete Profile (Super Admin only) ----
 export async function deleteProfile(userId, userName) {

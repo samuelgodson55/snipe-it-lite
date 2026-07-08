@@ -29,15 +29,21 @@ import { refreshDashboard } from './dashboard.js';
 import {
   openDispatchModal, submitDispatchForm, openPropsModal, recallException,
   saveCapacity, submitExceptionForm, submitCreatePoolForm, submitCsvImportForm,
+  deleteAssetPool, setAssetsSearch, setAssetsPerPage, changeAssetsPage,
 } from './components/assets.js';
-import { deleteProfile, submitCreateUserForm } from './components/users.js';
+import {
+  deleteProfile, submitCreateUserForm, setUsersSearch, setUsersPerPage, changeUsersPage,
+} from './components/users.js';
 import { exportAuditLogs, changeAuditPage, setAuditPerPage } from './components/audit.js';
 import { loadMyItems } from './components/myitems.js';
+import {
+  setOutsidersSearch, setOutsidersPerPage, changeOutsidersPage,
+} from './components/outsiders.js';
 import {
   openCustodyModal, processReturn, updateCustodySelection, toggleSelectAllCustody,
   processAllReturns, bulkProcessReturns,
 } from './components/custody.js';
-import { openProfileModal, submitChangePasswordForm } from './components/profile.js';
+import { openProfileModal, submitChangePasswordForm, ROLE_LABELS } from './components/profile.js';
 import { exportMyItems, exportCustodyItems, exportAllUsers, exportAllOutsiders } from './components/exports.js';
 
 // -----------------------------------------------------------------------------
@@ -45,6 +51,20 @@ import { exportMyItems, exportCustodyItems, exportAllUsers, exportAllOutsiders }
 // -----------------------------------------------------------------------------
 // Each handler receives the matched element (the one carrying data-action),
 // so it can read whatever data-* attributes it needs off it.
+//
+// 'change-page' is shared by every table's Prev/Next buttons (they all
+// carry the same data-action + a data-key telling us which table). Assets/
+// Users/Outsiders/Audit now each do TRUE server-side pagination (their own
+// `change*Page()` in their component file, mirroring components/audit.js),
+// while My Items still pages a client-side cached array via ui.js's
+// generic changePage() -- SERVER_PAGE_CHANGERS below is the lookup that
+// routes to the right one for a given data-key.
+const SERVER_PAGE_CHANGERS = {
+  assets: changeAssetsPage,
+  users: changeUsersPage,
+  outsiders: changeOutsidersPage,
+};
+
 const CLICK_ACTIONS = {
   'switch-tab': (el) => switchTab(el.dataset.tab),
   'close-modal': (el) => closeModal(el.dataset.modal),
@@ -58,7 +78,14 @@ const CLICK_ACTIONS = {
   'process-all-returns': () => processAllReturns(),
   'bulk-process-returns': () => bulkProcessReturns(),
   'delete-profile': (el) => deleteProfile(parseInt(el.dataset.userId, 10), el.dataset.userName),
-  'change-page': (el) => changePage(el.dataset.key, parseInt(el.dataset.delta, 10)),
+  'delete-asset-pool': (el) => deleteAssetPool(parseInt(el.dataset.assetId, 10), el.dataset.assetName),
+  'change-page': (el) => {
+    const key = el.dataset.key;
+    const delta = parseInt(el.dataset.delta, 10);
+    const serverChanger = SERVER_PAGE_CHANGERS[key];
+    if (serverChanger) serverChanger(delta);
+    else changePage(key, delta);
+  },
   'open-profile': () => openProfileModal(),
 
   // Properties-assigned exports (CSV/PDF) -- see components/exports.js.
@@ -69,7 +96,7 @@ const CLICK_ACTIONS = {
 
   // The audit ledger pages itself server-side (true limit/offset re-fetch
   // on every click) rather than through the shared client-side
-  // tableState/changePage() machinery used by the other tables -- see
+  // tableState/changePage() machinery used by My Items -- see
   // components/audit.js's module docstring for why.
   'change-audit-page': (el) => changeAuditPage(parseInt(el.dataset.delta, 10)),
 };
@@ -104,28 +131,42 @@ function wireDelegatedEvents() {
 // SEARCH BOX / ROWS-PER-PAGE WIRING
 // -----------------------------------------------------------------------------
 // Connects any search <input> or "Rows per page" <select> present on the
-// current page to the generic setSearch()/setPerPage() functions in ui.js.
-// Wrapped in `if (el)` checks throughout so this safely does nothing on
-// pages that don't have a particular table (e.g. staff.html has no asset
-// table, so `assetSearchInput` simply won't be found there).
+// current page to the right setter. Assets/Users/Outsiders now do TRUE
+// server-side search + pagination (their `set*Search()` is debounced and
+// re-fetches from the API -- see components/assets.js, components/
+// users.js, components/outsiders.js), while My Items still uses ui.js's
+// generic client-side setSearch()/setPerPage() (it filters/paginates an
+// already-downloaded array in memory, which is fine for one user's own,
+// inherently small, custody list). Wrapped in `if (el)` checks throughout
+// so this safely does nothing on pages that don't have a particular table
+// (e.g. staff.html has no asset table, so `assetSearchInput` simply won't
+// be found there).
 function wireTableControls() {
-  const controls = [
-    { key: 'assets', searchId: 'assetSearchInput', perPageId: 'assetPerPageSelect' },
-    { key: 'users', searchId: 'userSearchInput', perPageId: 'userPerPageSelect' },
-    { key: 'outsiders', searchId: 'outsiderSearchInput', perPageId: 'outsiderPerPageSelect' },
-    { key: 'myItems', searchId: 'myItemsSearchInput', perPageId: 'myItemsPerPageSelect' },
+  const serverDrivenControls = [
+    { searchId: 'assetSearchInput', perPageId: 'assetPerPageSelect', setSearch: setAssetsSearch, setPerPage: setAssetsPerPage },
+    { searchId: 'userSearchInput', perPageId: 'userPerPageSelect', setSearch: setUsersSearch, setPerPage: setUsersPerPage },
+    { searchId: 'outsiderSearchInput', perPageId: 'outsiderPerPageSelect', setSearch: setOutsidersSearch, setPerPage: setOutsidersPerPage },
   ];
-
-  controls.forEach(({ key, searchId, perPageId }) => {
+  serverDrivenControls.forEach(({ searchId, perPageId, setSearch: setServerSearch, setPerPage: setServerPerPage }) => {
     const searchInput = document.getElementById(searchId);
     if (searchInput) {
-      searchInput.addEventListener('input', () => setSearch(key, searchInput.value));
+      searchInput.addEventListener('input', () => setServerSearch(searchInput.value));
     }
     const perPageSelect = document.getElementById(perPageId);
     if (perPageSelect) {
-      perPageSelect.addEventListener('change', () => setPerPage(key, perPageSelect.value));
+      perPageSelect.addEventListener('change', () => setServerPerPage(perPageSelect.value));
     }
   });
+
+  // My Items: unchanged client-side path.
+  const myItemsSearchInput = document.getElementById('myItemsSearchInput');
+  if (myItemsSearchInput) {
+    myItemsSearchInput.addEventListener('input', () => setSearch('myItems', myItemsSearchInput.value));
+  }
+  const myItemsPerPageSelect = document.getElementById('myItemsPerPageSelect');
+  if (myItemsPerPageSelect) {
+    myItemsPerPageSelect.addEventListener('change', () => setPerPage('myItems', myItemsPerPageSelect.value));
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -280,6 +321,17 @@ document.addEventListener('DOMContentLoaded', () => {
     if (navName) navName.textContent = session.name;
     const navInitials = document.getElementById('navUserInitials');
     if (navInitials) navInitials.textContent = session.name.split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase();
+
+    // Account-type label under the name (e.g. "Super Admin", "Manager").
+    // Set it immediately from the JWT's own `role` claim -- decoded
+    // client-side already by getSession(), no extra request needed -- so
+    // every dashboard shows the real, currently-logged-in account's type
+    // instead of a hardcoded placeholder. On staff.html/customer.html,
+    // loadMyItems() below then refines this further with the more specific
+    // `department_role` once it comes back from the API (department_role
+    // isn't embedded in the JWT itself -- see auth_service.py).
+    const navRole = document.getElementById('myProfileRole');
+    if (navRole) navRole.textContent = ROLE_LABELS[session.role] || session.role;
 
     if (document.getElementById('assetTableBody') || document.getElementById('userTableBody')) {
       refreshDashboard();

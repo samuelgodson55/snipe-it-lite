@@ -70,10 +70,16 @@ def seed_db():
     `username` too (auto-derived from the email's local part, mirroring
     `services/user_service.py -> _derive_username()`), so `POST
     /auth/login` accepts EITHER value:
-      Super Admin -> r.adeyemi@corp.io   / username r.adeyemi   / SuperAdmin123!
+      Admin       -> r.adeyemi@corp.io   / username r.adeyemi   / Admin123!
       Manager     -> s.chen@corp.io      / username s.chen      / Manager123!
       Staff       -> t.okafor@corp.io    / username t.okafor    / Staff123!
       Customer    -> d.martins@customer.io / username d.martins / Customer123!
+
+    NOTE: there's no "Super Admin" row here on purpose. The Super Admin is
+    a single hardcoded identity configured via the SUPER_ADMIN_USERNAME/
+    SUPER_ADMIN_PASSWORD environment variables (see config.py and
+    security.py's super_admin_principal()) -- it's never a database row,
+    so it can't be seeded, edited, or deleted like the accounts below.
     """
     db = SessionLocal()
     try:
@@ -81,9 +87,13 @@ def seed_db():
             return  # Already seeded on a previous boot -- do nothing.
 
         # --- Demo user accounts -------------------------------------------------
-        super_admin = models.User(
-            name="R. Adeyemi", email="r.adeyemi@corp.io", username="r.adeyemi", role="super_admin",
-            password_hash=hash_password("SuperAdmin123!"), is_verified=True, is_active=True,
+        # "admin" has every privilege the hardcoded Super Admin has (see
+        # deps.py's _FULL_ADMIN_ROLES), but -- unlike the Super Admin --
+        # it's a normal, editable, deletable `users` row like any other
+        # account.
+        admin = models.User(
+            name="R. Adeyemi", email="r.adeyemi@corp.io", username="r.adeyemi", role="admin",
+            password_hash=hash_password("Admin123!"), is_verified=True, is_active=True,
         )
         manager = models.User(
             name="S. Chen", email="s.chen@corp.io", username="s.chen", role="manager",
@@ -108,7 +118,7 @@ def seed_db():
             department_role="External Client Contact",
             password_hash=hash_password("Customer123!"), is_verified=True, is_active=True,
         )
-        db.add_all([super_admin, manager, staff_1, staff_2, customer_1])
+        db.add_all([admin, manager, staff_1, staff_2, customer_1])
         db.commit()
 
         # --- Demo asset pools ----------------------------------------------------

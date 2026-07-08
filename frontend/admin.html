@@ -6,87 +6,26 @@
 <title>Snipe-IT Lite — Super Admin</title>
 
 <!-- =====================================================================
-     SYNCHRONOUS AUTH GUARD -- see the long comment inside the <script>
-     block below for the full explanation. Short version: this <style> +
-     <script> pair run BEFORE the rest of the page (including the Tailwind
-     CDN script and every dashboard element) is parsed, so an unauthorized
+     SYNCHRONOUS AUTH GUARD -- see js/auth-guard.js for the full
+     explanation. Short version: this stylesheet + script pair run BEFORE
+     the rest of the page (including the locally compiled Tailwind
+     stylesheet and every dashboard element) is parsed, so an unauthorized
      visitor never sees so much as a flash of this page's real content
-     before being redirected to the login screen.
+     before being redirected to the login screen. Both files are external
+     (not inline) specifically so this page's CSP doesn't need
+     'unsafe-inline' -- see nginx/default.conf.template's CSP comment.
      ===================================================================== -->
-<style>
-  body { display: none; }
-  html.authorized body { display: block; }
-</style>
-<script>
-  (function () {
-    // Only these roles may view admin.html. Kept as a plain array so it's
-    // easy to read/adjust -- compare against PAGE_ACCESS_RULES in js/auth.js,
-    // which re-checks the exact same rule again later as a safety net.
-    var ALLOWED_ROLES = ['super_admin', 'admin'];
+<link rel="stylesheet" href="css/auth-guard.css">
+<script src="js/auth-guard.js" data-allowed-roles="super_admin,admin"></script>
 
-    // Minimal, self-contained copy of auth.js's JWT decoder. We can't just
-    // call a function from the JS modules here because they're loaded with a
-    // <script> tag at the very end of <body> -- by the time it runs, the
-    // browser would already have parsed and painted this entire page.
-    function parseJwt(token) {
-      try {
-        var base64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-        return JSON.parse(decodeURIComponent(atob(base64).split('').map(function (c) {
-          return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-        }).join('')));
-      } catch (e) {
-        return null;
-      }
-    }
-
-    var token = localStorage.getItem('token');
-    var payload = token ? parseJwt(token) : null;
-    var expired = !payload || !payload.exp || payload.exp * 1000 < Date.now();
-
-    if (!payload || expired || ALLOWED_ROLES.indexOf(payload.role) === -1) {
-      if (expired && token) localStorage.removeItem('token');
-      // location.replace (not .href) so this doesn't leave the blocked
-      // dashboard page in browser history for a "back button" flash.
-      window.location.replace('index.html');
-    } else {
-      // Only NOW do we allow <body> to become visible (see the CSS above).
-      document.documentElement.classList.add('authorized');
-    }
-  })();
-</script>
-
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  tailwind.config = {
-    theme: {
-      extend: {
-        fontFamily: {
-          sans: ['Inter', 'ui-sans-serif', 'system-ui'],
-          mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
-        },
-        colors: {
-          canvas: '#0f1319',
-          card: '#171c25',
-          card2: '#1d232e',
-          border: '#2a3140',
-        }
-      }
-    }
-  }
-</script>
+<!-- Tailwind CSS is compiled locally at build time instead of being
+     pulled from cdn.tailwindcss.com at runtime -- see
+     build-tailwind/README.md for how to regenerate css/tailwind.css
+     after changing any class names in the HTML/JS. -->
+<link rel="stylesheet" href="css/tailwind.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  body { background-color:#0f1319; }
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-track { background: #171c25; }
-  ::-webkit-scrollbar-thumb { background: #2a3140; border-radius: 8px; }
-  ::-webkit-scrollbar-thumb:hover { background: #38404f; }
-  .tag-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
-  .glow-red { box-shadow: 0 0 0 1px rgba(244,63,94,0.25), 0 0 12px rgba(244,63,94,0.08); }
-  .backdrop { backdrop-filter: blur(3px); }
-  input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); cursor:pointer; }
-</style>
+<link rel="stylesheet" href="css/theme.css">
 </head>
 <!-- data-view="admin" tells the JS modules this is the full-privilege dashboard (vs "manager") -->
 <body class="min-h-screen font-sans text-slate-200 antialiased" data-view="admin">
@@ -108,14 +47,14 @@
       <div class="flex items-center gap-4">
         <span class="hidden items-center gap-1.5 rounded-full border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-rose-400 glow-red sm:flex">
           <span class="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse"></span>
-          Super Admin Mode
+          Admin Mode
         </span>
 
         <button type="button" id="navProfileBtn" data-action="open-profile" title="View profile &amp; change password" class="flex items-center gap-2.5 border-l border-border pl-4 transition hover:opacity-80">
           <div id="navUserInitials" class="h-8 w-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-xs font-bold text-white">RA</div>
           <div class="hidden text-right leading-tight md:block">
             <p id="navUserName" class="text-[13px] font-semibold text-slate-100">R. Adeyemi</p>
-            <p class="text-[11px] text-slate-500">IT Asset Ops</p>
+            <p id="myProfileRole" class="text-[11px] text-slate-500">Super Admin</p>
           </div>
         </button>
 
@@ -345,7 +284,7 @@
           <div>
             <label class="mb-1 block text-[12px] font-medium text-slate-400">Role</label>
             <select id="newUserRole" class="w-full rounded-lg border border-border bg-card2 px-3 py-2 text-[13px] text-slate-200 outline-none focus:border-blue-500/60">
-              <option value="super_admin">Super Admin</option>
+              <option value="admin">Admin</option>
               <option value="manager">Manager</option>
               <option value="staff" selected>Staff</option>
               <option value="customer">Customer</option>
@@ -618,9 +557,21 @@
         <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Properties Hub</p>
         <h3 id="propsAssetName" class="text-[18px] font-bold text-slate-50">—</h3>
       </div>
-      <button data-action="close-modal" data-modal="propsModal" class="rounded-md p-1.5 text-slate-500 transition hover:bg-card2 hover:text-slate-200">
-        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
+      <div class="flex items-center gap-2">
+        <!-- Delete Asset Pool (Super Admin only). Backend endpoint
+             (DELETE /assets/{id}) already existed and was already
+             enforced server-side (Super Admin-only, soft-delete, blocked
+             while outstanding checkouts/isolated units exist) -- this was
+             just missing a button to reach it. See
+             components/assets.js's deleteAssetPool(). -->
+        <button data-action="delete-asset-pool" id="propsDeleteBtn" data-asset-id="" data-asset-name="" class="flex items-center gap-1.5 rounded-md border border-rose-500/30 px-3 py-1.5 text-[12px] font-medium text-rose-400 transition hover:border-rose-500 hover:bg-rose-500/10">
+          <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg>
+          Delete Asset Pool
+        </button>
+        <button data-action="close-modal" data-modal="propsModal" class="rounded-md p-1.5 text-slate-500 transition hover:bg-card2 hover:text-slate-200">
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
     </div>
 
     <!-- Metric block -->

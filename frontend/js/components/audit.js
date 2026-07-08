@@ -6,24 +6,26 @@
 // it uses `API_URL` + the session token directly rather than `apiRequest`
 // (which assumes a JSON or passthrough-Response result, not a file download).
 //
-// PAGINATION NOTE (Data Quality & Usability requirement #4): unlike
-// assets/users/outsiders -- which fetch one generously-sized page ONCE and
-// then do fast client-side search/pagination in memory (see js/ui.js's
-// `filterAndPaginate()`) -- the audit ledger is genuinely unbounded (it's
-// an append-only log that grows for the entire lifetime of the system), so
-// this file does TRUE server-side pagination instead: every page turn or
-// "rows per page" change re-fetches just that slice from
-// `GET /audit-logs?limit=&offset=`. `auditState` below is this file's own
-// tiny bit of state (page number + rows-per-page + last-known total) --
-// it's intentionally NOT wired into js/ui.js's shared `tableState`/
-// `filterAndPaginate` machinery, since that machinery assumes the full
-// dataset is already sitting in the browser, which is exactly what we're
-// avoiding here.
+// PAGINATION NOTE (Data Quality & Usability requirement #4): the audit
+// ledger is genuinely unbounded (it's an append-only log that grows for
+// the entire lifetime of the system), so this file does TRUE server-side
+// pagination: every page turn or "rows per page" change re-fetches just
+// that slice from `GET /audit-logs?limit=&offset=`. `auditState` below is
+// this file's own tiny bit of state (page number + rows-per-page +
+// last-known total) -- it's intentionally NOT wired into js/ui.js's
+// client-side `tableState`/`filterAndPaginate` machinery, since that
+// machinery assumes the full dataset is already sitting in the browser,
+// which is exactly what we're avoiding here.
+//
+// This is now the same pattern used by the Asset/User/Outsider
+// directories (see components/assets.js, components/users.js,
+// components/outsiders.js) -- `renderServerPaginationBar()` in js/ui.js is
+// the bit all four of these files share.
 // =============================================================================
 
 import { apiRequest, API_URL } from '../api.js';
 import { getSession } from '../auth.js';
-import { escapeHtml } from '../ui.js';
+import { escapeHtml, renderServerPaginationBar } from '../ui.js';
 
 const auditState = { page: 1, perPage: 10, total: 0 };
 
@@ -43,32 +45,10 @@ export async function loadAuditLogs() {
       <td class="px-5 py-2.5 text-slate-500">${escapeHtml(l.details)}</td>
     </tr>`).join('') || `<tr><td colspan="4" class="px-5 py-6 text-center text-slate-500">No log entries yet.</td></tr>`;
 
-    renderAuditPaginationBar();
+    renderServerPaginationBar('audit', auditState);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="4" class="px-5 py-6 text-center text-rose-400">${escapeHtml(err.message)}</td></tr>`;
   }
-}
-
-// Updates the "Showing X-Y of Z" label and enables/disables Prev/Next --
-// only runs if the page actually has these elements (older pages without
-// the pagination bar simply skip this, same defensive pattern used
-// throughout this codebase).
-function renderAuditPaginationBar() {
-  const infoEl = document.getElementById('auditPageInfo');
-  const prevBtn = document.getElementById('auditPrevBtn');
-  const nextBtn = document.getElementById('auditNextBtn');
-
-  const startIndex = (auditState.page - 1) * auditState.perPage;
-  const shownCount = Math.min(auditState.perPage, Math.max(0, auditState.total - startIndex));
-  const totalPages = Math.max(1, Math.ceil(auditState.total / auditState.perPage));
-
-  if (infoEl) {
-    infoEl.textContent = auditState.total === 0
-      ? 'No log entries yet.'
-      : `Showing ${startIndex + 1}-${startIndex + shownCount} of ${auditState.total}`;
-  }
-  if (prevBtn) prevBtn.disabled = auditState.page <= 1;
-  if (nextBtn) nextBtn.disabled = auditState.page >= totalPages;
 }
 
 // Called by main.js's delegated click handler when Prev/Next is clicked.

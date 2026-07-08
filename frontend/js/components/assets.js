@@ -7,7 +7,7 @@
 // =============================================================================
 
 import { apiRequest } from '../api.js';
-import { escapeHtml, openModal, closeModal, toggleRoute, toggleCapacityEdit, statusBadge, tableState, registerRenderer, filterAndPaginate, renderPaginationBar } from '../ui.js';
+import { escapeHtml, openModal, closeModal, toggleRoute, toggleCapacityEdit, statusBadge, debounce, renderServerPaginationBar } from '../ui.js';
 import { refreshDashboard } from '../dashboard.js';
 
 let currentDispatchAssetId = null; // remembers which asset the open dispatch drawer is for
@@ -21,37 +21,39 @@ export function getCurrentPropsAssetId() {
 }
 
 // ---- Asset Inventory table ----
+// TRUE server-side search + pagination (same pattern as components/
+// audit.js's `auditState` -- see js/ui.js's module docstring on
+// `tableState` for why this moved off the old client-side
+// fetch-everything-once-then-filter-in-memory approach): every keystroke
+// in the search box (debounced), page turn, or "rows per page" change
+// re-fetches just that slice from `GET /assets?search=&limit=&offset=`
+// instead of re-filtering an already-downloaded array.
+const assetsState = { page: 1, perPage: 10, search: '', total: 0 };
+
 export async function loadAssets() {
   const tbody = document.getElementById('assetTableBody');
   if (!tbody) return; // this page doesn't have an asset table
   try {
-    // GET /assets now returns a paginated envelope --
-    // { items, total, limit, offset } -- instead of a bare array (Data
-    // Quality & Usability requirement #4). We request a generous limit so
-    // the existing fast client-side search/pagination in js/ui.js's
-    // filterAndPaginate() keeps working exactly as before for realistic
-    // inventory sizes; the backend still enforces a hard MAX_LIMIT cap
-    // regardless of what's requested, so a single call can never pull back
-    // an unbounded number of rows.
-    const result = await apiRequest('/assets?limit=1000');
-    tableState.assets.raw = result.items;
-    renderAssetsTable();
+    const offset = (assetsState.page - 1) * assetsState.perPage;
+    const params = new URLSearchParams({ limit: assetsState.perPage, offset });
+    if (assetsState.search.trim()) params.set('search', assetsState.search.trim());
+    const result = await apiRequest(`/assets?${params.toString()}`);
+    assetsState.total = result.total;
+    renderAssetsTable(result.items);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="4" class="px-5 py-6 text-center text-rose-400">${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-export function renderAssetsTable() {
+function renderAssetsTable(items) {
   const tbody = document.getElementById('assetTableBody');
   if (!tbody) return;
   const isManagerView = document.body.dataset.view === 'manager';
+  const isSuperAdminView = document.body.dataset.view === 'admin';
 
-  // Search across asset name only -- that's the only user-facing text field
-  // an Asset Pool has (see "Search by asset name, tag, or serial…" hint).
-  const { pageRows, total, startIndex } = filterAndPaginate('assets', ['name']);
-  document.querySelectorAll('.asset-pool-count').forEach(el => el.textContent = total);
+  document.querySelectorAll('.asset-pool-count').forEach(el => el.textContent = assetsState.total);
 
-  tbody.innerHTML = pageRows.map(a => `
+  tbody.innerHTML = items.map(a => `
     <tr class="transition hover:bg-card2/40">
       <td class="px-5 py-3.5">
         <p class="font-medium text-slate-100">${escapeHtml(a.name)}</p>
@@ -65,13 +67,60 @@ export function renderAssetsTable() {
             ? `<button data-action="open-props" data-asset-id="${a.id}" class="rounded-md px-2.5 py-1.5 text-[12px] font-medium text-slate-400 underline-offset-2 transition hover:text-blue-400 hover:underline">View Pool details</button>`
             : `<button data-action="open-props" data-asset-id="${a.id}" class="rounded-md border border-border px-2.5 py-1.5 text-[12px] font-medium text-slate-300 transition hover:border-slate-500 hover:text-white">Properties Hub</button>`}
           <button data-action="open-dispatch" data-asset-id="${a.id}" data-asset-name="${escapeHtml(a.name)}" data-available="${a.available_quantity}" class="rounded-md bg-blue-600/90 px-2.5 py-1.5 text-[12px] font-medium text-white transition hover:bg-blue-500">Issue / Dispatch</button>
+          ${isSuperAdminView
+            ? `<button data-action="delete-asset-pool" data-asset-id="${a.id}" data-asset-name="${escapeHtml(a.name)}" class="rounded-md border border-rose-500/30 px-2.5 py-1.5 text-[12px] font-medium text-rose-400 transition hover:border-rose-500 hover:bg-rose-500/10">Delete</button>`
+            : ''}
         </div>
       </td>
     </tr>`).join('') || `<tr><td colspan="4" class="px-5 py-6 text-center text-slate-500">No asset pools found.</td></tr>`;
 
-  renderPaginationBar('assets', total, startIndex, pageRows.length);
+  renderServerPaginationBar('assets', assetsState);
 }
-registerRenderer('assets', renderAssetsTable);
+
+// Called from the search box's 'input' listener (main.js), debounced.
+export const setAssetsSearch = debounce((value) => {
+  assetsState.search = value;
+  assetsState.page = 1; // always jump back to page 1 on a new search
+  loadAssets();
+});
+
+// Called from the "Rows per page" <select>'s 'change' listener (main.js).
+export function setAssetsPerPage(value) {
+  assetsState.perPage = parseInt(value, 10) || 10;
+  assetsState.page = 1;
+  loadAssets();
+}
+
+// Called by main.js's delegated click handler when Prev/Next is clicked.
+export function changeAssetsPage(delta) {
+  const nextPage = assetsState.page + delta;
+  if (nextPage < 1) return;
+  assetsState.page = nextPage;
+  loadAssets();
+}
+
+// ---- Delete Asset Pool (Super Admin only) ----
+// Backend endpoint (DELETE /assets/{id}, see backend/api/assets.py ->
+// services/asset_service.py's delete_asset_type) already existed and was
+// already enforced as Super Admin-only + soft-delete + "no outstanding
+// checkouts or isolated units" -- there was just no button in the UI to
+// reach it. This wires the Inventory table's row-level "Delete" action
+// (added above in renderAssetsTable) to it, mirroring
+// components/users.js's deleteProfile().
+export async function deleteAssetPool(assetId, assetName) {
+  if (!confirm(`Delete asset pool "${assetName}"? This cannot be undone, and only pools with no outstanding checkouts or isolated units can be deleted.`)) return;
+  try {
+    const result = await apiRequest(`/assets/${assetId}`, { method: 'DELETE' });
+    alert(result.message);
+    // If the Properties Hub for this exact pool happens to be open, close
+    // it -- it would otherwise be showing details for a pool that no
+    // longer exists in active inventory.
+    if (currentPropsAssetId === assetId) closeModal('propsModal');
+    refreshDashboard();
+  } catch (err) {
+    alert(err.message);
+  }
+}
 
 // ---- Dispatch (Issue / Checkout) drawer ----
 
@@ -175,6 +224,14 @@ export async function openPropsModal(assetId) {
     // instead of being re-derived here from possibly-stale numbers.
     document.getElementById('propsOutbound').textContent = details.outbound_quantity;
     document.getElementById('propsRepair').textContent = details.isolated_quantity;
+
+    // Only present on admin.html (Super Admin's Properties Hub) -- the
+    // manager.html read-only version of this modal has no delete button.
+    const deleteBtn = document.getElementById('propsDeleteBtn');
+    if (deleteBtn) {
+      deleteBtn.dataset.assetId = assetId;
+      deleteBtn.dataset.assetName = details.name;
+    }
 
     const capacityInput = document.getElementById('capacityInput');
     if (capacityInput) capacityInput.value = details.total_quantity;

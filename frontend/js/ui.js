@@ -99,24 +99,38 @@ export function toggleCapacityEdit() {
 // =============================================================================
 // SEARCH + PAGINATION (generic, reused by every listing table)
 // -----------------------------------------------------------------------------
-// Every table on the dashboards ("Asset Inventory", "User Directory" / "Team
-// Allocation Matrix", "Ad-Hoc Directory", and the self-service "My Items"
-// tables) works the same way:
+// The self-service "My Items" table (a single user's OWN checked-out
+// items -- inherently small and bounded, since nobody has thousands of
+// items in their own custody) is the one remaining table that works this
+// way:
 //   1. Fetch the FULL list from the API once and cache it in `tableState`.
 //   2. Whenever the user types in the search box, changes "Rows per page",
 //      or clicks Prev/Next, we DON'T hit the API again -- we just re-filter
-//      and re-slice the cached array in memory and re-render. This is what
-//      fixes the old "Rows per page does nothing" bug and keeps the UI fast
-//      even with a large list, since filtering/pagination happen instantly
-//      client-side instead of round-tripping to the server.
-//   3. Each component's `renderXxxTable()` reads `tableState[key]`, figures
-//      out which "page" of rows to show, renders just those rows, and
-//      updates the "Showing X-Y of Z" + Prev/Next button states.
+//      and re-slice the cached array in memory and re-render, which keeps
+//      the UI fast since filtering/pagination happen instantly client-side
+//      instead of round-tripping to the server.
+//   3. `renderMyItemsTable()` reads `tableState.myItems`, figures out which
+//      "page" of rows to show, renders just those rows, and updates the
+//      "Showing X-Y of Z" + Prev/Next button states.
+//
+// The Asset Inventory, User Directory, and Ad-Hoc Directory tables used to
+// work this same way too (fetch one generously-sized page ONCE, then
+// filter/paginate it in memory), but -- like the audit ledger before them
+// (see components/audit.js's module docstring) -- those directories are
+// unbounded in principle and can grow well past what's comfortable to hand
+// the browser in one response. They now do TRUE server-side search +
+// pagination instead: every keystroke (debounced), page turn, or "rows per
+// page" change re-fetches just that slice from the API via `?search=&
+// limit=&offset=`. Each of components/assets.js, components/users.js, and
+// components/outsiders.js keeps its own small state object for this
+// (mirroring `auditState` in components/audit.js) -- intentionally NOT
+// entries in `tableState` below, since that machinery assumes the full
+// dataset is already sitting in the browser, which is exactly what we're
+// avoiding for these three now. `debounce()` and
+// `renderServerPaginationBar()` further down in this file are the bits
+// those three files (and audit.js) share.
 // =============================================================================
 export const tableState = {
-  assets: { raw: [], search: '', page: 1, perPage: 10 },
-  users: { raw: [], search: '', page: 1, perPage: 10 },
-  outsiders: { raw: [], search: '', page: 1, perPage: 10 },
   myItems: { raw: [], search: '', page: 1, perPage: 10 },
 };
 
@@ -194,6 +208,52 @@ export function changePage(key, delta) {
   if (!tableState[key]) return;
   tableState[key].page += delta;
   if (RENDERERS[key]) RENDERERS[key]();
+}
+
+// =============================================================================
+// SERVER-SIDE SEARCH + PAGINATION HELPERS
+// -----------------------------------------------------------------------------
+// Shared by every table that does TRUE server-side search/pagination
+// (components/audit.js, components/assets.js, components/users.js,
+// components/outsiders.js) -- as opposed to the client-side
+// tableState/filterAndPaginate machinery above, which only "My Items"
+// still uses.
+// =============================================================================
+
+// Delays calling `fn` until `delayMs` has passed without another call --
+// used on the search `<input>`'s 'input' event so a true server-side table
+// re-fetches once after someone finishes typing, rather than firing one API
+// request per keystroke.
+export function debounce(fn, delayMs = 300) {
+  let timeoutId;
+  return (...args) => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => fn(...args), delayMs);
+  };
+}
+
+// Updates the "Showing X-Y of Z" label and enables/disables Prev/Next for a
+// server-paginated table, given that table's own small `{ page, perPage,
+// total }` state object (e.g. `auditState`, `assetsState`, `usersState`,
+// `outsidersState`) and the `key` used to build its element ids
+// (`${key}PageInfo` / `${key}PrevBtn` / `${key}NextBtn`). Safe to call even
+// if a page doesn't have these elements.
+export function renderServerPaginationBar(key, state) {
+  const infoEl = document.getElementById(`${key}PageInfo`);
+  const prevBtn = document.getElementById(`${key}PrevBtn`);
+  const nextBtn = document.getElementById(`${key}NextBtn`);
+
+  const startIndex = (state.page - 1) * state.perPage;
+  const shownCount = Math.min(state.perPage, Math.max(0, state.total - startIndex));
+  const totalPages = Math.max(1, Math.ceil(state.total / state.perPage));
+
+  if (infoEl) {
+    infoEl.textContent = state.total === 0
+      ? 'No results found.'
+      : `Showing ${startIndex + 1}-${startIndex + shownCount} of ${state.total}`;
+  }
+  if (prevBtn) prevBtn.disabled = state.page <= 1;
+  if (nextBtn) nextBtn.disabled = state.page >= totalPages;
 }
 
 export function statusBadge(available) {

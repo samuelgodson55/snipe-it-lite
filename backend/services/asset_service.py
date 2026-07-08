@@ -9,11 +9,13 @@ advanced checkout flow, and CSV batch import. Used by api/assets.py.
 import csv
 import io
 import datetime
+from typing import Optional
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 import models
+from services.search_utils import apply_search_filter
 from models import utc_now
 from schemas.assets import AssetTypeCreate, ExceptionCreate, AdvancedCheckoutRequest, QuantityUpdateRequest
 from services.stock import recalculate_asset_stock
@@ -58,20 +60,29 @@ def create_asset_type(db: Session, asset: AssetTypeCreate, user: dict) -> dict:
     return {"message": "Asset type created successfully", "id": new_asset_type.id}
 
 
-def list_assets(db: Session, limit: int = DEFAULT_LIMIT, offset: int = 0) -> dict:
+def list_assets(db: Session, limit: int = DEFAULT_LIMIT, offset: int = 0, search: Optional[str] = None) -> dict:
     """
     Any authenticated user (admin, manager, or staff) can view the pool
     list. Soft-deleted pools are excluded -- they're gone from active
     inventory even though the row is kept for historical checkouts.
 
-    PAGINATION (Data Quality & Usability requirement #4): `limit`/`offset`
-    cap how many pools a single request can return; `total` tells the
-    caller the true size of the inventory regardless of page size.
+    PAGINATION + SEARCH (Data Quality & Usability requirement #4, extended
+    to true server-side search): `limit`/`offset` cap how many pools a
+    single request can return; `total` tells the caller the true size of
+    the (optionally search-narrowed) inventory regardless of page size.
+    `search` -- when present -- narrows the result to pools whose name
+    contains it (case-insensitive), matching the single field the Asset
+    Inventory table's search box has always searched by (see
+    js/components/assets.js). Applied and counted BEFORE the offset/limit
+    slice, so `total`/pagination always reflect the filtered set, not the
+    whole table.
     """
     limit = max(1, min(limit, MAX_LIMIT))
     offset = max(0, offset)
 
-    query = db.query(models.AssetType).filter(models.AssetType.is_deleted == False).order_by(models.AssetType.id)
+    query = db.query(models.AssetType).filter(models.AssetType.is_deleted == False)
+    query = apply_search_filter(query, search, [models.AssetType.name])
+    query = query.order_by(models.AssetType.id)
     total = query.count()
     items = query.offset(offset).limit(limit).all()
     return {"items": items, "total": total, "limit": limit, "offset": offset}

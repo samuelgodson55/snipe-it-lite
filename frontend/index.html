@@ -4,31 +4,14 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Snipe-IT Lite — Login</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  tailwind.config = {
-    theme: {
-      extend: {
-        fontFamily: {
-          sans: ['Inter', 'ui-sans-serif', 'system-ui'],
-          mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
-        },
-        colors: {
-          canvas: '#0f1319',
-          card: '#171c25',
-          card2: '#1d232e',
-          border: '#2a3140',
-        }
-      }
-    }
-  }
-</script>
+<!-- Tailwind CSS is compiled locally at build time instead of being
+     pulled from cdn.tailwindcss.com at runtime -- see
+     build-tailwind/README.md for how to regenerate css/tailwind.css
+     after changing any class names in the HTML/JS. -->
+<link rel="stylesheet" href="css/tailwind.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  body { background-color: #0f1319; }
-  .tag-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
-</style>
+<link rel="stylesheet" href="css/theme.css">
 </head>
 <body class="min-h-screen font-sans text-slate-200 antialiased flex items-center justify-center p-4">
 
@@ -92,7 +75,7 @@
     <!-- Demo credentials helper (safe to delete once you provision your own users) -->
     <div class="rounded-lg border border-border bg-card2/50 p-3 text-[11px] text-slate-500 space-y-1">
       <p class="font-semibold text-slate-400">Demo accounts (seeded on first boot):</p>
-      <p class="tag-mono">Super Admin — r.adeyemi@corp.io / SuperAdmin123!</p>
+      <p class="tag-mono">Admin — r.adeyemi@corp.io / Admin123!</p>
       <p class="tag-mono">Manager — s.chen@corp.io / Manager123!</p>
       <p class="tag-mono">Staff — t.okafor@corp.io / Staff123!</p>
       <p class="tag-mono">Customer — d.martins@customer.io / Customer123!</p>

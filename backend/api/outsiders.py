@@ -4,6 +4,7 @@ api/outsiders.py
 Ad-Hoc (Unlinked) Directory: external individuals with no login account.
 """
 
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
@@ -31,10 +32,11 @@ def _file_response(content: bytes, media_type: str, filename: str) -> Response:
 def get_outsiders(
     limit: int = Query(outsider_service.DEFAULT_LIMIT, ge=1, le=outsider_service.MAX_LIMIT, description="Max rows to return"),
     offset: int = Query(0, ge=0, description="Rows to skip (for paging through a large directory)"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match against name, contact details, or company"),
     db: Session = Depends(get_db),
     user: dict = Depends(require_privileged_role),
 ):
-    return outsider_service.list_outsiders(db, limit, offset)
+    return outsider_service.list_outsiders(db, limit, offset, search)
 
 
 @router.get("/export")

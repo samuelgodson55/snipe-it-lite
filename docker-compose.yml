@@ -14,13 +14,20 @@
 #
 # Three services:
 #   db       - PostgreSQL database that stores everything
-#   backend  - FastAPI app (main.py) talking to the db
-#   frontend - plain static files (index.html/admin.html/app.js/etc.) served
-#              by a lightweight nginx container
+#   backend  - FastAPI app (main.py) talking to the db (not published to the
+#              host anymore -- see the "frontend" service below)
+#   frontend - the static site (index.html/admin.html/js/*) PLUS an nginx
+#              reverse proxy in front of it, built from nginx/Dockerfile.
+#              nginx serves the frontend directly and transparently forwards
+#              every /api/* request to the backend container over Docker's
+#              internal network -- see nginx/default.conf.template for the
+#              full explanation. This is also the ONLY multi-tier-portable
+#              piece: the exact same image runs on Render/cloud too, just
+#              with different BACKEND_HOST/BACKEND_PORT env vars.
 #
-# Once running:
-#   Frontend (login page): http://localhost:8080
-#   Backend API docs:       http://localhost:8000/docs
+# Once running, everything is served from ONE origin:
+#   App + API:        http://localhost:8080          (nginx)
+#   API docs:          http://localhost:8080/docs     (proxied by nginx)
 # -----------------------------------------------------------------------------
 services:
   db:
@@ -66,6 +73,12 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your .env file -- see .env.example}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-12}
+      # Now mostly defense-in-depth: since the browser always calls the
+      # SAME origin that served the page (nginx proxies /api/* under the
+      # hood -- see nginx/default.conf.template), this almost never matters
+      # for same-origin requests anymore. It still matters if you ever hit
+      # this backend directly (bypassing nginx) or from a genuinely
+      # different origin, so it stays here rather than being removed.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1}
       # Operations & Observability requirement #1: gate the startup
       # init_db()/seed_db() calls instead of always running them. Leave
@@ -79,19 +92,72 @@ services:
       # Operations & Observability requirement #3: login rate limiting.
       LOGIN_RATE_LIMIT_MAX: ${LOGIN_RATE_LIMIT_MAX:-5}
       LOGIN_RATE_LIMIT_WINDOW_SECONDS: ${LOGIN_RATE_LIMIT_WINDOW_SECONDS:-60}
+      # SECURITY: exposes/hides /docs, /redoc, /openapi.json -- see
+      # config.py's ENABLE_API_DOCS docstring. Defaults to "true" for local
+      # dev convenience; set "false" in a real production .env. Must be
+      # kept in sync with the frontend service's own ENABLE_API_DOCS below
+      # (same .env key drives both, so this happens automatically as long
+      # as you don't override just one of the two services individually).
+      ENABLE_API_DOCS: ${ENABLE_API_DOCS:-true}
+      # Hardcoded Super Admin (root account) -- see .env.example and
+      # backend/config.py's SUPER_ADMIN_* docstring. Defaults keep local
+      # Docker Compose working out of the box; generate a real password
+      # before deploying anywhere real.
+      SUPER_ADMIN_USERNAME: ${SUPER_ADMIN_USERNAME:-superadmin}
+      SUPER_ADMIN_NAME: ${SUPER_ADMIN_NAME:-Super Admin}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD:-change-this-super-admin-password}
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "8000:8000"
+    # NOTE: no host `ports:` mapping here anymore -- see nginx reverse-proxy
+    # comment block below for why. The backend is still fully reachable by
+    # the frontend container over Compose's internal network at
+    # "backend:8000"; it's just no longer directly exposed to the host/
+    # public internet. If you need to hit it directly for debugging (e.g.
+    # curling it, or Postman), temporarily add back:
+    #     ports:
+    #       - "8000:8000"
 
+  # ---------------------------------------------------------------------
+  # frontend / nginx reverse proxy (requirement: multi-tier deployment)
+  # ---------------------------------------------------------------------
+  # This is no longer a bare `nginx:alpine` + bind-mounted static files --
+  # it's now built from nginx/Dockerfile, which produces ONE self-contained
+  # image bundling both the static site AND an environment-templated nginx
+  # config (see nginx/default.conf.template). That image is what gets
+  # deployed unmodified to Render and your cloud environment too; only the
+  # environment variables below change between tiers.
+  #
+  # SECURITY: this is now the ONLY container with a host-published port.
+  # The browser talks exclusively to nginx; nginx is the sole thing that
+  # forwards /api/* requests on to the backend over the private Compose
+  # network (see BACKEND_HOST/BACKEND_PORT below). The backend is no longer
+  # reachable directly from outside Docker at all -- shrinking the app's
+  # public attack surface to one hardened, well-understood entry point.
   frontend:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
     container_name: snipeit_lite_frontend
     restart: unless-stopped
-    volumes:
-      # Mount our static site straight into nginx's web root, read-only.
-      - ./frontend:/usr/share/nginx/html:ro
+    environment:
+      # Which port nginx listens on INSIDE the container. Left at 80 here
+      # since we're the ones choosing the host-side port via the `ports:`
+      # mapping below; a platform like Render would instead inject its own
+      # $PORT and this line wouldn't exist in that environment at all.
+      PORT: ${FRONTEND_PORT:-80}
+      # "backend" is this Compose file's service name above -- Docker's
+      # embedded DNS resolves it automatically to that container's current
+      # IP on every request (see default.conf.template's `resolver`
+      # directive for why "every request" matters, not just "at startup").
+      BACKEND_HOST: ${BACKEND_HOST:-backend}
+      BACKEND_PORT: ${BACKEND_PORT:-8000}
+      RESOLVER_IP: ${RESOLVER_IP:-127.0.0.11}
+      # SECURITY: must match the backend service's own ENABLE_API_DOCS
+      # above -- see that line's comment and config.py's ENABLE_API_DOCS
+      # docstring. Reading from the SAME .env key here means the two
+      # services can't silently drift out of sync with each other.
+      ENABLE_API_DOCS: ${ENABLE_API_DOCS:-true}
     ports:
       - "8080:80"
     depends_on:

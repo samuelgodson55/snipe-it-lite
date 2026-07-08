@@ -8,33 +8,38 @@
 // =============================================================================
 
 import { apiRequest } from '../api.js';
-import { escapeHtml, tableState, registerRenderer, filterAndPaginate, renderPaginationBar } from '../ui.js';
+import { escapeHtml, debounce, renderServerPaginationBar } from '../ui.js';
+
+// TRUE server-side search + pagination (same pattern as components/
+// audit.js's `auditState` / components/assets.js's `assetsState` /
+// components/users.js's `usersState`): every keystroke in the search box
+// (debounced), page turn, or "rows per page" change re-fetches just that
+// slice from `GET /outsiders?search=&limit=&offset=` instead of
+// re-filtering an already-downloaded array.
+const outsidersState = { page: 1, perPage: 10, search: '', total: 0 };
 
 export async function loadOutsiders() {
   const tbody = document.getElementById('outsiderTableBody');
   if (!tbody) return; // this page doesn't have an ad-hoc directory table
   try {
-    // GET /outsiders now returns a paginated envelope --
-    // { items, total, limit, offset } -- instead of a bare array (Data
-    // Quality & Usability requirement #4). A generous limit keeps the
-    // existing client-side search/pagination behaving as before for
-    // realistic dataset sizes, while the backend still enforces a hard cap.
-    const result = await apiRequest('/outsiders?limit=1000');
-    tableState.outsiders.raw = result.items;
-    renderOutsidersTable();
+    const offset = (outsidersState.page - 1) * outsidersState.perPage;
+    const params = new URLSearchParams({ limit: outsidersState.perPage, offset });
+    if (outsidersState.search.trim()) params.set('search', outsidersState.search.trim());
+    const result = await apiRequest(`/outsiders?${params.toString()}`);
+    outsidersState.total = result.total;
+    renderOutsidersTable(result.items);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="4" class="px-5 py-6 text-center text-rose-400">${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
-export function renderOutsidersTable() {
+function renderOutsidersTable(outsiders) {
   const tbody = document.getElementById('outsiderTableBody');
   if (!tbody) return;
 
-  const { pageRows, total, startIndex } = filterAndPaginate('outsiders', ['name', 'contact_details', 'company']);
-  document.querySelectorAll('.outsider-count').forEach(el => el.textContent = total);
+  document.querySelectorAll('.outsider-count').forEach(el => el.textContent = outsidersState.total);
 
-  tbody.innerHTML = pageRows.map(o => {
+  tbody.innerHTML = outsiders.map(o => {
     const initials = o.name.split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase();
     return `
     <tr class="transition hover:bg-card2/40">
@@ -57,6 +62,27 @@ export function renderOutsidersTable() {
     </tr>`;
   }).join('') || `<tr><td colspan="4" class="px-5 py-6 text-center text-slate-500">No ad-hoc individuals on file yet.</td></tr>`;
 
-  renderPaginationBar('outsiders', total, startIndex, pageRows.length);
+  renderServerPaginationBar('outsiders', outsidersState);
 }
-registerRenderer('outsiders', renderOutsidersTable);
+
+// Called from the search box's 'input' listener (main.js), debounced.
+export const setOutsidersSearch = debounce((value) => {
+  outsidersState.search = value;
+  outsidersState.page = 1; // always jump back to page 1 on a new search
+  loadOutsiders();
+});
+
+// Called from the "Rows per page" <select>'s 'change' listener (main.js).
+export function setOutsidersPerPage(value) {
+  outsidersState.perPage = parseInt(value, 10) || 10;
+  outsidersState.page = 1;
+  loadOutsiders();
+}
+
+// Called by main.js's delegated click handler when Prev/Next is clicked.
+export function changeOutsidersPage(delta) {
+  const nextPage = outsidersState.page + delta;
+  if (nextPage < 1) return;
+  outsidersState.page = nextPage;
+  loadOutsiders();
+}

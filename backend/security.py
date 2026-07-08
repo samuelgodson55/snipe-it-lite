@@ -12,6 +12,7 @@ Keeping shared logic in its own tiny module avoids that problem entirely.
 """
 
 import re
+import types
 import datetime
 import jwt  # PyJWT package
 from pwdlib import PasswordHash
@@ -43,6 +44,67 @@ def hash_password(plain_password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Check a plaintext password attempt against a stored hash."""
     return password_hash.verify(plain_password, hashed_password)
+
+
+# ---------------------------------------------------------------------------
+# HARDCODED SUPER ADMIN (root account)
+# ---------------------------------------------------------------------------
+# The Super Admin is deliberately NOT a `models.User` row -- it's a single
+# fixed identity built entirely from config.py's SUPER_ADMIN_* settings.
+# That's what makes it possible to guarantee, structurally, that:
+#   1. There is always EXACTLY one Super Admin (it's one constant, not a
+#      queryable/creatable table row).
+#   2. It can never be deleted -- `DELETE /users/{id}` (see
+#      services/user_service.py -> delete_user()) only ever operates on
+#      real `users` table rows, and this account isn't one.
+#   3. It never appears in the User Directory or any other listing --
+#      those all come from `SELECT ... FROM users`, which this identity
+#      never touches.
+#
+# SUPER_ADMIN_ID is a sentinel used as this account's JWT "sub" (subject)
+# claim. Postgres SERIAL primary keys always start at 1 and only ever go
+# up, so a negative id can never collide with a genuine `users.id` value --
+# deps.py's get_current_user() uses this to recognize a Super Admin token
+# and skip the (otherwise mandatory) "look this user up in the database"
+# step entirely.
+SUPER_ADMIN_ID = -1
+SUPER_ADMIN_ROLE = "super_admin"
+
+
+def super_admin_password_hash() -> str | None:
+    """
+    Hashes `settings.SUPER_ADMIN_PASSWORD` once. Returns None when that
+    setting is empty, which fully and deliberately disables the Super
+    Admin login path (see services/auth_service.py -> login()) rather than
+    ever accepting a blank password.
+    """
+    if not settings.SUPER_ADMIN_PASSWORD:
+        return None
+    return hash_password(settings.SUPER_ADMIN_PASSWORD)
+
+
+# Computed once at process startup, exactly like _DUMMY_PASSWORD_HASH in
+# auth_service.py -- hashing is deliberately expensive, so we never want to
+# repeat it on every single login attempt.
+SUPER_ADMIN_PASSWORD_HASH = super_admin_password_hash()
+
+
+def super_admin_principal():
+    """
+    A `models.User`-shaped stand-in for the hardcoded Super Admin, so
+    `create_access_token()` below can treat it exactly like a real user
+    when issuing a JWT. `email` is synthetic (there's no real mailbox) --
+    it only exists so audit-log entries and `operator=` fields have
+    something readable to display for actions this account performs.
+    """
+    return types.SimpleNamespace(
+        id=SUPER_ADMIN_ID,
+        name=settings.SUPER_ADMIN_NAME,
+        email=f"{settings.SUPER_ADMIN_USERNAME}@local",
+        username=settings.SUPER_ADMIN_USERNAME,
+        role=SUPER_ADMIN_ROLE,
+        department=None,
+    )
 
 
 # ---------------------------------------------------------------------------

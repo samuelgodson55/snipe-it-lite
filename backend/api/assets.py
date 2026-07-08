@@ -5,6 +5,7 @@ Everything under /assets: pool CRUD, capacity, maintenance exceptions,
 reconciliation check-in, the advanced checkout flow, and CSV batch import.
 """
 
+from typing import Optional
 from fastapi import APIRouter, Depends, UploadFile, File, Query
 from sqlalchemy.orm import Session
 
@@ -25,10 +26,11 @@ def create_asset_type(asset: AssetTypeCreate, db: Session = Depends(get_db), use
 def list_assets(
     limit: int = Query(asset_service.DEFAULT_LIMIT, ge=1, le=asset_service.MAX_LIMIT, description="Max rows to return"),
     offset: int = Query(0, ge=0, description="Rows to skip (for paging through a large inventory)"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match against asset pool name"),
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    return asset_service.list_assets(db, limit, offset)
+    return asset_service.list_assets(db, limit, offset, search)
 
 
 @router.get("/{asset_id}/details")

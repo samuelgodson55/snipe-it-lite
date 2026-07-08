@@ -5,22 +5,32 @@ System-user account CRUD and self-service/custody lookups. Used by
 api/users.py.
 """
 
+from typing import Optional
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 
 import models
 from models import utc_now
-from security import hash_password
+from config import settings
+from security import hash_password, SUPER_ADMIN_ID, SUPER_ADMIN_ROLE
 from schemas.users import UserCreateRequest
 import services.export_service as export_service
+from services.search_utils import apply_search_filter
 
 # Roles a Manager is allowed to hand out when provisioning a new login.
 # A Manager can create Staff and Customer accounts, but must NEVER be able
-# to create another Manager or a Super Admin account for themselves --
-# that would be an easy privilege-escalation hole. Super Admins are not
+# to create another Manager or an Admin account for themselves -- that
+# would be an easy privilege-escalation hole. Admins/Super Admin are not
 # limited by this list (checked in create_user below).
 MANAGER_PROVISIONABLE_ROLES = ("staff", "customer")
+
+# "super_admin" is reserved for the single hardcoded root identity (see
+# security.py's super_admin_principal()) -- it is never a valid role for a
+# database-backed account, no matter who is provisioning it. Anyone who
+# needs Super-Admin-equivalent privileges on a normal, deletable account
+# gets the "admin" role instead (see deps.py's _FULL_ADMIN_ROLES).
+RESERVED_ROLES = (SUPER_ADMIN_ROLE,)
 
 # Directories can grow large over time -- these caps stop a single request
 # from ever having to load an unbounded number of rows into memory at once
@@ -49,7 +59,13 @@ def _derive_username(db: Session, email: str) -> str:
     base = email.split("@")[0].strip().lower()
     candidate = base
     suffix = 2
-    while db.query(models.User).filter(models.User.username == candidate).first():
+    # Also steer clear of the reserved Super Admin username (not a `users`
+    # row, so the query above alone wouldn't catch it) -- letting a real
+    # account share it would let that account get silently shadowed by the
+    # hardcoded Super Admin login path, which checks that identifier FIRST
+    # (see auth_service.py -> login()).
+    reserved = settings.SUPER_ADMIN_USERNAME.strip().lower()
+    while candidate == reserved or db.query(models.User).filter(models.User.username == candidate).first():
         candidate = f"{base}{suffix}"
         suffix += 1
     return candidate
@@ -61,9 +77,11 @@ def create_user(db: Session, req: UserCreateRequest, user: dict) -> dict:
     this, but a Manager's power here is intentionally narrower:
 
       1. A Manager may only create "staff" or "customer" accounts -- never
-         "manager" or "super_admin". This is enforced on the BACKEND (not
-         just hidden in the UI), so a Manager can't grant themselves admin
-         rights via a raw API call either.
+         "manager" or "admin" (and never "super_admin" either, which is
+         reserved for the hardcoded root account and blocked for EVERY
+         caller, not just Managers -- see RESERVED_ROLES below). This is
+         enforced on the BACKEND (not just hidden in the UI), so a Manager
+         can't grant themselves admin rights via a raw API call either.
       2. A Manager-created "staff" account is automatically pinned to the
          MANAGER'S OWN department -- whatever the request body says is
          ignored for department. This keeps the "Team Allocation Matrix"
@@ -75,6 +93,15 @@ def create_user(db: Session, req: UserCreateRequest, user: dict) -> dict:
     Super Admins are unrestricted, exactly like before.
     """
     requested_role = req.role.lower()
+
+    # "super_admin" is reserved for the one hardcoded root identity -- it
+    # can never be assigned to a database-backed account, even by another
+    # Super Admin/Admin. See RESERVED_ROLES above.
+    if requested_role in RESERVED_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail="The 'super_admin' role is reserved for the hardcoded root account and cannot be assigned. Use 'admin' instead.",
+        )
 
     if user["role"] == "manager" and requested_role not in MANAGER_PROVISIONABLE_ROLES:
         raise HTTPException(
@@ -112,7 +139,7 @@ def create_user(db: Session, req: UserCreateRequest, user: dict) -> dict:
     return {"message": f"User {new_user.name} created successfully."}
 
 
-def list_users(db: Session, user: dict, limit: int = DEFAULT_LIMIT, offset: int = 0) -> dict:
+def list_users(db: Session, user: dict, limit: int = DEFAULT_LIMIT, offset: int = 0, search: Optional[str] = None) -> dict:
     """
     Super Admins see the entire directory. Managers see:
       - every account in their own department (their "Team Allocation
@@ -133,20 +160,29 @@ def list_users(db: Session, user: dict, limit: int = DEFAULT_LIMIT, offset: int 
     column on the User Directory / Team Allocation Matrix shows a real
     number instead of always reading 0.
 
-    PAGINATION (Data Quality & Usability requirement #4): `limit`/`offset`
-    bound how many rows a single request can return -- see the
-    DEFAULT_LIMIT/MAX_LIMIT constants above this function. We run
-    `query.count()` for the total BEFORE slicing with `.offset()/.limit()`,
-    so the caller always knows the true total size of the directory even
-    though it only received one page of it -- and we only compute the
-    (relatively expensive) per-user `checkout_count` aggregation for the
-    rows actually being returned, not the entire table.
+    PAGINATION + SEARCH (Data Quality & Usability requirement #4, extended
+    to true server-side search): `limit`/`offset` bound how many rows a
+    single request can return -- see the DEFAULT_LIMIT/MAX_LIMIT constants
+    above this function. `search` -- when present -- narrows the directory
+    to rows where name, email, role, department, or department_role
+    case-insensitively contains it, the same set of fields the User
+    Directory table's search box has always searched by (see
+    js/components/users.js). We run `query.count()` for the (search-scoped)
+    total BEFORE slicing with `.offset()/.limit()`, so the caller always
+    knows the true total size of the directory even though it only
+    received one page of it -- and we only compute the (relatively
+    expensive) per-user `checkout_count` aggregation for the rows actually
+    being returned, not the entire table.
     """
     query = db.query(models.User).filter(models.User.is_deleted == False)
     if user["role"] == "manager":
         query = query.filter(
             or_(models.User.department == user["department"], models.User.role == "customer")
         )
+    query = apply_search_filter(query, search, [
+        models.User.name, models.User.email, models.User.role,
+        models.User.department, models.User.department_role,
+    ])
 
     limit = max(1, min(limit, MAX_LIMIT))
     offset = max(0, offset)
@@ -344,6 +380,13 @@ def delete_user(db: Session, user_id: int, user: dict) -> dict:
     """
     if user_id == int(user["sub"]):
         raise HTTPException(status_code=403, detail="You cannot delete your own account while logged in as it.")
+
+    # Defense in depth: the hardcoded Super Admin (see security.py's
+    # SUPER_ADMIN_ID) isn't a `users` table row, so the query below would
+    # already return nothing for it -- this just gives a clearer error
+    # than a generic 404 if it's ever targeted directly.
+    if user_id == SUPER_ADMIN_ID:
+        raise HTTPException(status_code=400, detail="The Super Admin account cannot be deleted.")
 
     target = db.query(models.User).filter(models.User.id == user_id, models.User.is_deleted == False).first()
     if not target:

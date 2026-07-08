@@ -88,9 +88,9 @@ export async function login(identifier, password) {
 // (including these modules) has loaded, as a safety net.
 const PAGE_ACCESS_RULES = {
   'admin.html': ['super_admin', 'admin'],
-  'manager.html': ['manager', 'super_admin'],
-  'staff.html': ['staff', 'super_admin'],
-  'customer.html': ['customer', 'super_admin'],
+  'manager.html': ['manager', 'super_admin', 'admin'],
+  'staff.html': ['staff', 'super_admin', 'admin'],
+  'customer.html': ['customer', 'super_admin', 'admin'],
 };
 
 export function currentPageName() {
